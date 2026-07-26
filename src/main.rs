@@ -291,6 +291,13 @@ fn load_conf() -> Result<Config, Error> {
 }
 
 fn main() {
+    // reqwest is built with `rustls-no-provider`, which avoids pulling in
+    // aws-lc-rs (and its cmake build dependency). The process-wide crypto
+    // provider must therefore be installed before any TLS client is built.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Could not install rustls crypto provider.");
+
     let mut config = load_conf().expect("Could not load configuration file.");
 
     pretty_env_logger::formatted_builder()

@@ -36,7 +36,16 @@ time = "0.3"
 tokio = { version = "1.53", features = ["full"] }
 url = "2"
 urlencoding = "2"
-reqwest = { version = "0.13", features = ["blocking", "json", "form"] }
+reqwest = { version = "0.13", default-features = false, features = [
+    "blocking",
+    "json",
+    "form",
+    "rustls-no-provider",
+    "charset",
+    "http2",
+    "system-proxy",
+] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 xdg = "3.0.0"
 
 # The profile that 'dist' will build with
