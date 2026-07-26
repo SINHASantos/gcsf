@@ -36,7 +36,7 @@ time = "0.3"
 tokio = { version = "1.53", features = ["full"] }
 url = "2"
 urlencoding = "2"
-reqwest = { version = "0.12", features = ["blocking", "json"] }
+reqwest = { version = "0.13", features = ["blocking", "json", "form"] }
 xdg = "3.0.0"
 
 # The profile that 'dist' will build with
