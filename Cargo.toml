@@ -17,7 +17,11 @@ ctrlc = "3.5.2"
 failure = "0.1.8"
 fuser = { version = "0.16", features = ["libfuse"] }
 futures = {version =  "0.3.33", features = ["executor"]}
-google-drive3 = "=6.0.0"
+google-drive3 = "=7.0.0"
+# google-drive3 7.0.0 depends on yup-oauth2 with default features disabled, which
+# leaves out `InstalledFlowAuthenticator::builder`. Depend on it directly to turn
+# the required feature back on; the re-export at drive_facade.rs stays valid.
+yup-oauth2 = { version = "12", default-features = false, features = ["hyper-rustls"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
 http-body-util = "0.1"
 bytes = "1.12"
