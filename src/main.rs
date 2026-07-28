@@ -219,10 +219,10 @@ fn mount_gcsf(config: Config, mountpoint: &str) {
     };
     info!("File system created.");
 
-    info!("Mounting to {}", &mountpoint);
+    info!("Mounting to {}", mountpoint);
     match fuser::spawn_mount2(fs, mountpoint, &options) {
         Ok(_session) => {
-            info!("Mounted to {}", &mountpoint);
+            info!("Mounted to {}", mountpoint);
 
             let running = Arc::new(AtomicBool::new(true));
             let r = running.clone();
@@ -237,12 +237,12 @@ fn mount_gcsf(config: Config, mountpoint: &str) {
                 thread::sleep(time::Duration::from_millis(50));
             }
         }
-        Err(e) => error!("Could not mount to {}: {}", &mountpoint, e),
+        Err(e) => error!("Could not mount to {}: {}", mountpoint, e),
     };
 }
 
 fn login(config: &mut Config) -> Result<(), Error> {
-    debug!("{:#?}", &config);
+    debug!("{:#?}", config);
 
     if config.token_file().exists() {
         return Err(err_msg(format!(
@@ -297,7 +297,7 @@ fn load_conf() -> Result<Config, Error> {
         .place_config_file("gcsf.toml")
         .map_err(|_| err_msg("Cannot create configuration directory"))?;
 
-    info!("Config file: {:?}", &config_file);
+    info!("Config file: {:?}", config_file);
 
     if !config_file.exists() {
         let mut config_file = fs::File::create(config_file.clone())
@@ -371,7 +371,7 @@ fn main() {
                 Ok(_) => {
                     println!(
                         "Successfully logged in. Saved credentials to {:?}",
-                        &config.token_file()
+                        config.token_file()
                     );
                 }
                 Err(e) => {
@@ -384,10 +384,10 @@ fn main() {
             let tf = config.token_file();
             match fs::remove_file(&tf) {
                 Ok(_) => {
-                    println!("Successfully removed {:?}", &tf);
+                    println!("Successfully removed {:?}", tf);
                 }
                 Err(e) => {
-                    println!("Could not remove {:?}: {}", &tf, e);
+                    println!("Could not remove {:?}: {}", tf, e);
                 }
             };
         }
@@ -405,7 +405,7 @@ fn main() {
             } else {
                 println!("Sessions:");
                 for session in sessions {
-                    println!("\t- {}", &session);
+                    println!("\t- {}", session);
                 }
             }
         }

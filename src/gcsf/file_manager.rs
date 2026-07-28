@@ -119,7 +119,7 @@ impl FileManager {
             .into_iter()
             .filter(|change| change.file.is_some())
         {
-            debug!("Processing a change from {:?}", &change.time);
+            debug!("Processing a change from {:?}", change.time);
             let id = FileId::DriveId(change.file_id.unwrap());
             let drive_f = change.file.unwrap();
 
@@ -131,10 +131,10 @@ impl FileManager {
                     drive_f.clone(),
                     self.add_extensions_to_special_files,
                 );
-                debug!("newly created file: {:#?}", &f);
+                debug!("newly created file: {:#?}", f);
 
                 let parent = f.drive_parent().unwrap();
-                debug!("drive parent: {:#?}", &parent);
+                debug!("drive parent: {:#?}", parent);
                 self.add_file_locally(f, Some(FileId::DriveId(parent.clone())))?;
                 debug!("self.add_file_locally() finished");
 
@@ -419,7 +419,7 @@ impl FileManager {
     pub fn flush(&mut self, id: &FileId) -> Result<(), Error> {
         let file = self
             .get_drive_id(id)
-            .ok_or_else(|| err_msg(format!("Cannot find drive id of {:?}", &id)))?;
+            .ok_or_else(|| err_msg(format!("Cannot find drive id of {:?}", id)))?;
         self.df.flush(&file)
     }
 
@@ -464,7 +464,7 @@ impl FileManager {
     fn move_locally(&mut self, id: &FileId, new_parent: &FileId) -> Result<(), Error> {
         let current_node = self
             .get_node_id(id)
-            .ok_or_else(|| err_msg(format!("Cannot find node_id of {:?}", &id)))?;
+            .ok_or_else(|| err_msg(format!("Cannot find node_id of {:?}", id)))?;
         let target_node = self
             .get_node_id(new_parent)
             .ok_or_else(|| err_msg("Target node doesn't exist"))?;
@@ -549,13 +549,13 @@ impl FileManager {
     fn delete_locally(&mut self, id: &FileId) -> Result<(), Error> {
         let node_id = self
             .get_node_id(id)
-            .ok_or_else(|| err_msg(format!("Cannot find node_id of {:?}", &id)))?;
+            .ok_or_else(|| err_msg(format!("Cannot find node_id of {:?}", id)))?;
         let inode = self
             .get_inode(id)
-            .ok_or_else(|| err_msg(format!("Cannot find inode of {:?}", &id)))?;
+            .ok_or_else(|| err_msg(format!("Cannot find inode of {:?}", id)))?;
         let drive_id = self
             .get_drive_id(id)
-            .ok_or_else(|| err_msg(format!("Cannot find drive id of {:?}", &id)))?;
+            .ok_or_else(|| err_msg(format!("Cannot find drive id of {:?}", id)))?;
 
         self.tree.remove_node(node_id, DropChildren)?;
         self.files.remove(&inode);
@@ -583,13 +583,13 @@ impl FileManager {
 
     /// Moves a file to the Trash directory locally *and* on Drive.
     pub fn move_file_to_trash(&mut self, id: &FileId, also_on_drive: bool) -> Result<(), Error> {
-        debug!("Moving {:?} to trash.", &id);
+        debug!("Moving {:?} to trash.", id);
         let node_id = self
             .get_node_id(id)
-            .ok_or_else(|| err_msg(format!("Cannot find node_id of {:?}", &id)))?;
+            .ok_or_else(|| err_msg(format!("Cannot find node_id of {:?}", id)))?;
         let drive_id = self
             .get_drive_id(id)
-            .ok_or_else(|| err_msg(format!("Cannot find drive_id of {:?}", &id)))?;
+            .ok_or_else(|| err_msg(format!("Cannot find drive_id of {:?}", id)))?;
         let trash_id = self
             .get_node_id(&FileId::Inode(TRASH_INODE))
             .ok_or_else(|| err_msg("Cannot find node_id of Trash dir"))?;
@@ -608,7 +608,7 @@ impl FileManager {
         // Using DriveId instead.
         if also_on_drive {
             self.get_mut_file(&FileId::DriveId(drive_id.clone()))
-                .ok_or_else(|| err_msg(format!("Cannot find {:?}", &drive_id)))?
+                .ok_or_else(|| err_msg(format!("Cannot find {:?}", drive_id)))?
                 .set_trashed(true)?;
             self.df.move_to_trash(drive_id)?;
         }
@@ -628,7 +628,7 @@ impl FileManager {
     pub fn file_is_trashed(&mut self, id: &FileId) -> Result<bool, Error> {
         let file = self
             .get_file(id)
-            .ok_or_else(|| err_msg(format!("Cannot find node_id of {:?}", &id)))?;
+            .ok_or_else(|| err_msg(format!("Cannot find node_id of {:?}", id)))?;
 
         Ok(file.is_trashed())
     }
@@ -644,7 +644,7 @@ impl FileManager {
         // name will probably change in this method.
         let id = FileId::Inode(
             self.get_inode(id)
-                .ok_or_else(|| err_msg(format!("Cannot find inode of {:?}", &id)))?,
+                .ok_or_else(|| err_msg(format!("Cannot find inode of {:?}", id)))?,
         );
 
         // Get old parent before moving (for suffix recalculation)
@@ -652,7 +652,7 @@ impl FileManager {
 
         let current_node = self
             .get_node_id(&id)
-            .ok_or_else(|| err_msg(format!("Cannot find node_id of {:?}", &id)))?;
+            .ok_or_else(|| err_msg(format!("Cannot find node_id of {:?}", id)))?;
         let target_node = self
             .get_node_id(&FileId::Inode(new_parent))
             .ok_or_else(|| err_msg("Target node doesn't exist"))?;
@@ -678,17 +678,17 @@ impl FileManager {
 
         let drive_id = self
             .get_drive_id(&id)
-            .ok_or_else(|| err_msg(format!("Cannot find drive_id of {:?}", &id)))?;
+            .ok_or_else(|| err_msg(format!("Cannot find drive_id of {:?}", id)))?;
         let parent_id = self
             .get_drive_id(&FileId::Inode(new_parent))
             .ok_or_else(|| {
                 err_msg(format!(
                     "Cannot find drive_id of {:?}",
-                    &FileId::Inode(new_parent)
+                    FileId::Inode(new_parent)
                 ))
             })?;
 
-        debug!("parent_id: {}", &parent_id);
+        debug!("parent_id: {}", parent_id);
         self.df.move_to(&drive_id, &parent_id, &new_name)?;
         Ok(())
     }

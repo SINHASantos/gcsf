@@ -267,7 +267,7 @@ impl DriveFacade {
 
                 match result {
                     Ok(response) => {
-                        debug!("response: {:?}", &response);
+                        debug!("response: {:?}", response);
                         response
                     }
                     // These refusals are properties of the file itself, so retrying
@@ -326,7 +326,7 @@ impl DriveFacade {
             .for_each(|pending_write| {
                 debug!(
                     "Applying pending write with offset {} on {}",
-                    &pending_write.offset, &pending_write.id
+                    pending_write.offset, pending_write.id
                 );
                 let required_size = pending_write.offset + pending_write.data.len();
 
@@ -707,7 +707,7 @@ impl DriveFacade {
         let mime_guess = data.sniff_mime_type().unwrap_or("application/octet-stream");
         debug!(
             "Updating file content for {}. Mime type guess based on content: {}",
-            &id, &mime_guess
+            id, mime_guess
         );
 
         let file = drive3::api::File {
