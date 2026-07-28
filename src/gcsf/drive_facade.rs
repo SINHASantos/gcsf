@@ -69,6 +69,47 @@ lazy_static! {
     };
 }
 
+lazy_static! {
+    /// Reasons Drive gives for an export it will never be able to perform. Files
+    /// hitting one of these are described in place rather than failing to read.
+    static ref PERMANENT_EXPORT_FAILURES: HashSet<&'static str> = hashset! {
+        // The file is past the size Drive is willing to export (10MB at the time
+        // of writing). Reported as HTTP 403.
+        "exportSizeLimitExceeded",
+        // Export only applies to Docs Editors files.
+        "fileNotExportable",
+        "cannotDownloadAbusiveFile",
+    };
+}
+
+/// Collects the `reason` fields Drive reports in an API error body. Returns an
+/// empty vector for transport-level errors, which carry no such body.
+fn error_reasons(error: &drive3::Error) -> Vec<String> {
+    error_details(error, "reason")
+}
+
+/// Collects the human-readable `message` fields Drive reports in an API error body.
+fn error_messages(error: &drive3::Error) -> Vec<String> {
+    error_details(error, "message")
+}
+
+fn error_details(error: &drive3::Error, field: &str) -> Vec<String> {
+    let drive3::Error::BadRequest(body) = error else {
+        return Vec::new();
+    };
+
+    body["error"]["errors"]
+        .as_array()
+        .map(|errors| {
+            errors
+                .iter()
+                .filter_map(|e| e[field].as_str())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 impl DriveFacade {
     /// Creates a new DriveFacade with a given config.
     pub fn new(config: &Config) -> Self {
@@ -161,12 +202,30 @@ impl DriveFacade {
             self.hub
                 .files()
                 .get(id)
-                .param("fields", "id,name,parents,mimeType,webContentLink")
+                .param("fields", "id,name,parents,mimeType,webViewLink")
                 .add_scope(drive3::api::Scope::Full)
                 .doit(),
         )
         .map(|(_response, file)| file)
         .map_err(|e| err_msg(format!("{:#?}", e)))
+    }
+
+    /// Builds the stand-in content served for a file Drive will not hand over,
+    /// explaining why and pointing at the web UI where it can still be opened.
+    fn unexportable_placeholder(&self, drive_id: &str, reason: &str) -> Vec<u8> {
+        let link = self
+            .get_file_metadata(drive_id)
+            .ok()
+            .and_then(|metadata| metadata.web_view_link)
+            .unwrap_or_else(|| String::from("<unavailable>"));
+
+        format!(
+            "UNEXPORTABLE_FILE: This file could not be retrieved because {}. \
+             It can be opened at: {}\n",
+            reason.trim_end_matches('.'),
+            link
+        )
+        .into_bytes()
     }
 
     /// Retrieves the content of a Drive file. If `mime_type` is specified, this method will
@@ -180,20 +239,13 @@ impl DriveFacade {
         if let Some(mime) = mime_type.clone()
             && UNEXPORTABLE_MIME_TYPES.contains::<str>(&mime)
         {
-            return Ok(format!(
-                "UNEXPORTABLE_FILE: The MIME type of this \
-                     file is {:?}, which can not be exported from Drive. Web \
-                     content link provided by Drive: {:?}\n",
-                mime,
-                self.get_file_metadata(drive_id)
-                    .ok()
-                    .map(|metadata| metadata.web_view_link)
-                    .unwrap_or_default()
-            )
-            .as_bytes()
-            .to_vec());
+            return Ok(self.unexportable_placeholder(
+                drive_id,
+                &format!("its MIME type is {:?}, which Drive cannot export", mime),
+            ));
         }
 
+        let unexportable_mime = mime_type.clone().unwrap_or_default();
         let export_type: Option<&'static str> = mime_type
             .and_then(|ref t| MIME_TYPES.get::<str>(t))
             .cloned();
@@ -202,18 +254,40 @@ impl DriveFacade {
 
         let response = match export_type {
             Some(t) => {
-                let response = rt
-                    .block_on(
-                        self.hub
-                            .files()
-                            .export(drive_id, t)
-                            .add_scope(drive3::api::Scope::Full)
-                            .doit(),
-                    )
-                    .map_err(|e| err_msg(format!("{:#?}", e)))?;
+                let result = rt.block_on(
+                    self.hub
+                        .files()
+                        .export(drive_id, t)
+                        .add_scope(drive3::api::Scope::Full)
+                        .doit(),
+                );
 
-                debug!("response: {:?}", &response);
-                response
+                match result {
+                    Ok(response) => {
+                        debug!("response: {:?}", &response);
+                        response
+                    }
+                    // These refusals are properties of the file itself, so retrying
+                    // will never help. Describe the problem in the file content
+                    // rather than failing the read with an error the user cannot
+                    // act on. Anything else is treated as a genuine failure.
+                    Err(ref e)
+                        if error_reasons(e)
+                            .iter()
+                            .any(|reason| PERMANENT_EXPORT_FAILURES.contains(reason.as_str())) =>
+                    {
+                        warn!("Cannot export {}: {}", drive_id, error_messages(e).join("; "));
+                        return Ok(self.unexportable_placeholder(
+                            drive_id,
+                            &format!(
+                                "Drive refused to export it as {:?}: {}",
+                                unexportable_mime,
+                                error_messages(e).join("; ")
+                            ),
+                        ));
+                    }
+                    Err(e) => return Err(err_msg(format!("{:#?}", e))),
+                }
             }
             None => {
                 let (response, _empty_file) = rt
