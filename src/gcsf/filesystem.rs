@@ -152,12 +152,16 @@ impl Filesystem for Gcsf {
             })
             .unwrap();
 
-        reply.data(
-            self.manager
-                .df
-                .read(&id, mime, offset as usize, size as usize)
-                .unwrap_or(&[]),
-        );
+        match self
+            .manager
+            .df
+            .read(&id, mime, offset as usize, size as usize)
+        {
+            Some(data) => reply.data(data),
+            // Returning an empty buffer here would be indistinguishable from a
+            // genuinely empty file, silently hiding the failure from the caller.
+            None => reply.error(EIO),
+        }
     }
 
     fn write(

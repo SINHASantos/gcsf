@@ -592,7 +592,16 @@ impl DriveFacade {
             )));
         }
 
-        let mut file_data = self.get_file_content(id, None).unwrap_or_default();
+        // Pending writes are patches applied on top of the current content, so a
+        // failure to fetch it must abort the flush. Defaulting to an empty buffer
+        // here would upload the patches alone, discarding everything else the file
+        // holds on Drive. The pending writes are left in place for a later retry.
+        let mut file_data = self.get_file_content(id, None).map_err(|e| {
+            err_msg(format!(
+                "flush({}): refusing to overwrite, could not fetch current content: {}",
+                id, e
+            ))
+        })?;
         self.apply_pending_writes_on_data(DriveId::from(id), &mut file_data);
         self.update_file_content(DriveId::from(id), &file_data)?;
 
