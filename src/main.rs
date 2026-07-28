@@ -15,6 +15,7 @@ use clap::{Parser, Subcommand};
 use failure::{Error, err_msg};
 use std::fs;
 use std::io::prelude::*;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -258,6 +259,38 @@ fn login(config: &mut Config) -> Result<(), Error> {
     Ok(())
 }
 
+/// Whether a file in the configuration directory holds session credentials.
+///
+/// A session is the token file yup-oauth2 persists: entries pairing the scopes
+/// a token was granted for with the token itself. Every field of the token is
+/// optional, so the shape is what identifies the file. Anything else living in
+/// the same directory (the configuration, backups of it, subdirectories) is not
+/// a session and should not be listed as one.
+fn is_session_file(path: &Path) -> bool {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return false;
+    };
+
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&contents) else {
+        return false;
+    };
+
+    // Current versions store a bare array. Older ones wrapped the same entries
+    // in an object under "tokens"; sessions written back then are still listed
+    // so that they remain visible to `gcsf logout`.
+    let entries = match parsed.get("tokens") {
+        Some(tokens) => tokens.as_array(),
+        None => parsed.as_array(),
+    };
+
+    entries.is_some_and(|entries| {
+        !entries.is_empty()
+            && entries
+                .iter()
+                .all(|entry| entry["scopes"].is_array() && entry["token"].is_object())
+    })
+}
+
 fn load_conf() -> Result<Config, Error> {
     let xdg_dirs = xdg::BaseDirectories::with_prefix("gcsf");
     let config_file = xdg_dirs
@@ -359,12 +392,11 @@ fn main() {
             };
         }
         Commands::List => {
-            let exception = String::from("gcsf.toml");
             let mut sessions: Vec<_> = fs::read_dir(config.config_dir())
                 .unwrap()
                 .map(Result::unwrap)
+                .filter(|entry| is_session_file(&entry.path()))
                 .map(|f| f.file_name().to_str().unwrap().to_string())
-                .filter(|name| name != &exception)
                 .collect();
             sessions.sort();
 
