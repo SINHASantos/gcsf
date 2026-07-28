@@ -56,7 +56,10 @@ lazy_static! {
     static ref MIME_TYPES: HashMap<&'static str, &'static str> = hashmap! {
         "application/vnd.google-apps.document" => "application/vnd.oasis.opendocument.text",
         "application/vnd.google-apps.presentation" => "application/vnd.oasis.opendocument.presentation",
-        "application/vnd.google-apps.spreadsheet" => "application/vnd.oasis.opendocument.spreadsheet",
+        // Drive advertises ODS in exportLinks but answers export requests for it
+        // with HTTP 500, so ask for xlsx instead. Keep EXTENSIONS in file.rs in
+        // sync with the formats chosen here.
+        "application/vnd.google-apps.spreadsheet" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         "application/vnd.google-apps.drawing" => "image/png",
         "application/vnd.google-apps.site" => "text/plain",
     };

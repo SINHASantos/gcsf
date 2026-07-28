@@ -42,7 +42,8 @@ lazy_static! {
     static ref EXTENSIONS: HashMap<&'static str, &'static str> = hashmap! {
             "application/vnd.google-apps.document" => "#.odt",
             "application/vnd.google-apps.presentation" => "#.odp",
-            "application/vnd.google-apps.spreadsheet" => "#.ods",
+            // Must match the export format chosen in MIME_TYPES in drive_facade.rs.
+            "application/vnd.google-apps.spreadsheet" => "#.xlsx",
             "application/vnd.google-apps.drawing" => "#.png",
             "application/vnd.google-apps.site" => "#.txt",
     };
