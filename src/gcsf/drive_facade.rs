@@ -253,6 +253,12 @@ impl DriveFacade {
                 );
                 let required_size = pending_write.offset + pending_write.data.len();
 
+                // NOTE: this truncates whenever the write ends before the current
+                // end of the buffer, so a partial write drops the rest of the file.
+                // It is nonetheless load-bearing: setattr() only records the new
+                // size in the inode attributes and never touches the content, so
+                // this resize is the only thing implementing O_TRUNC. Making writes
+                // grow-only requires implementing truncation for real first.
                 data.resize(required_size, 0);
                 data[pending_write.offset..].copy_from_slice(&pending_write.data[..]);
             });
@@ -661,7 +667,11 @@ impl DriveFacade {
             .storage_quota
             .ok_or_else(|| err_msg("size_and_capacity(): no storage quota in response"))?;
 
-        let usage = u64::try_from(storage_quota.usage.unwrap())?;
+        let usage = u64::try_from(
+            storage_quota
+                .usage
+                .ok_or_else(|| err_msg("size_and_capacity(): no usage in storage quota"))?,
+        )?;
         let limit = storage_quota
             .limit
             .map(|s| u64::try_from(s).unwrap_or_default());
