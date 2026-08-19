@@ -192,4 +192,4 @@ You installed the prebuilt binaries but couldn't run it. Fix by installing rust 
 
 Contributions are welcome. Documentation available on [docs.rs/gcsf](https://docs.rs/gcsf). You can also help by reporting or fixing [issues](https://github.com/harababurel/gcsf/issues).
 
-[![Star History Chart](https://api.star-history.com/svg?repos=harababurel/gcsf&type=Date)](https://star-history.com/#harababurel/gcsf&Date)
+[![Star History Chart](https://star-history.dera.page/svg?repos=harababurel/gcsf&type=Date)](https://star-history.dera.page/#harababurel/gcsf&Date)
