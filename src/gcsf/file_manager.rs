@@ -2,7 +2,7 @@ use super::{File, FileId};
 use crate::DriveFacade;
 use crate::drive3;
 use failure::{Error, err_msg};
-use fuser::{FileAttr, FileType};
+use fuser::{FileAttr, FileType, INodeNo};
 use id_tree::InsertBehavior::*;
 use id_tree::MoveBehavior::*;
 use id_tree::RemoveBehavior::*;
@@ -18,18 +18,6 @@ pub type DriveId = String;
 const ROOT_INODE: Inode = 1;
 const TRASH_INODE: Inode = 2;
 const SHARED_INODE: Inode = 3;
-
-macro_rules! unwrap_or_continue {
-    ($res:expr) => {
-        match $res {
-            Some(val) => val,
-            None => {
-                warn!("unwrap_or_continue!(): skipped.");
-                continue;
-            }
-        }
-    };
-}
 
 /// Manages files locally and uses a DriveFacade in order to communicate with Google Drive and to ensure consistency between the local and remote state.
 pub struct FileManager {
@@ -104,24 +92,34 @@ impl FileManager {
     /// Tries to retrieve recent changes from the `DriveFacade` and apply them locally in order to
     /// maintain data consistency. Fails early if not enough time has passed since the last sync.
     pub fn sync(&mut self) -> Result<(), Error> {
-        if SystemTime::now().duration_since(self.last_sync).unwrap() < self.sync_interval {
+        let now = SystemTime::now();
+        if now.duration_since(self.last_sync).unwrap_or_default() < self.sync_interval {
             return Err(err_msg(
                 "Not enough time has passed since last sync. Will do nothing.",
             ));
         }
 
         info!("Checking for changes and possibly applying them.");
-        self.last_sync = SystemTime::now();
+        let (changes, next_changes_token) = self.df.get_all_changes()?;
 
-        for change in self
-            .df
-            .get_all_changes()?
-            .into_iter()
-            .filter(|change| change.file.is_some())
-        {
+        for change in changes {
             debug!("Processing a change from {:?}", change.time);
-            let id = FileId::DriveId(change.file_id.unwrap());
-            let drive_f = change.file.unwrap();
+            let drive_id = change
+                .file_id
+                .ok_or_else(|| err_msg("Drive change did not include a file id"))?;
+            let id = FileId::DriveId(drive_id);
+
+            if change.removed == Some(true) {
+                debug!("Removed file. Remove it locally.");
+                if self.contains(&id) {
+                    self.delete_locally(&id)?;
+                }
+                continue;
+            }
+
+            let drive_f = change
+                .file
+                .ok_or_else(|| err_msg("Drive change did not include file metadata"))?;
 
             // New file. Create it locally
             if !self.contains(&id) {
@@ -133,7 +131,9 @@ impl FileManager {
                 );
                 debug!("newly created file: {:#?}", f);
 
-                let parent = f.drive_parent().unwrap();
+                let parent = f
+                    .drive_parent()
+                    .ok_or_else(|| err_msg("Changed Drive file did not include a parent"))?;
                 debug!("drive parent: {:#?}", parent);
                 self.add_file_locally(f, Some(FileId::DriveId(parent.clone())))?;
                 debug!("self.add_file_locally() finished");
@@ -149,20 +149,7 @@ impl FileManager {
             // Trashed file. Move it to trash locally
             if Some(true) == drive_f.trashed {
                 debug!("Trashed file. Move it to trash locally");
-                let result = self.move_file_to_trash(&id, false);
-                if result.is_err() {
-                    error!("Could not move to trash: {:?}", result)
-                }
-                continue;
-            }
-
-            // Removed file. Remove it locally.
-            if let Some(true) = change.removed {
-                debug!("Removed file. Remove it locally.");
-                let result = self.delete_locally(&id);
-                if result.is_err() {
-                    error!("Could not delete locally: {:?}", result)
-                }
+                self.move_file_to_trash(&id, false)?;
                 continue;
             }
 
@@ -171,14 +158,16 @@ impl FileManager {
             let old_parent = self.get_parent_inode(&id);
             let new_parent = {
                 let add_extension = self.add_extensions_to_special_files;
-                let f = unwrap_or_continue!(self.get_mut_file(&id));
+                let f = self
+                    .get_mut_file(&id)
+                    .ok_or_else(|| err_msg("Changed Drive file is missing from the local index"))?;
                 *f = File::from_drive_file(f.inode(), drive_f.clone(), add_extension);
-                FileId::DriveId(f.drive_parent().unwrap())
+                FileId::DriveId(
+                    f.drive_parent()
+                        .ok_or_else(|| err_msg("Changed Drive file did not include a parent"))?,
+                )
             };
-            let result = self.move_locally(&id, &new_parent);
-            if result.is_err() {
-                error!("Could not move locally: {:?}", result)
-            }
+            self.move_locally(&id, &new_parent)?;
 
             // Recalculate suffixes for both old and new parent directories
             if self.rename_identical_files {
@@ -191,6 +180,8 @@ impl FileManager {
             }
         }
 
+        self.df.commit_changes_token(next_changes_token);
+        self.last_sync = now;
         Ok(())
     }
 
@@ -281,7 +272,7 @@ impl FileManager {
         File {
             name: String::from("."),
             attr: FileAttr {
-                ino: ROOT_INODE,
+                ino: INodeNo(ROOT_INODE),
                 size: 512,
                 blocks: 1,
                 blksize: 512,
@@ -308,7 +299,7 @@ impl FileManager {
         File {
             name: name.to_string(),
             attr: FileAttr {
-                ino: preferred_inode.unwrap_or_else(|| self.next_available_inode()),
+                ino: INodeNo(preferred_inode.unwrap_or_else(|| self.next_available_inode())),
                 size: 512,
                 blocks: 1,
                 blksize: 512,
@@ -408,9 +399,25 @@ impl FileManager {
 
     /// Creates a file on Drive and adds it to the local file tree.
     pub fn create_file(&mut self, mut file: File, parent: Option<FileId>) -> Result<(), Error> {
-        let drive_id = self.df.create(file.drive_file.as_ref().unwrap())?;
-        file.set_drive_id(drive_id);
-        self.add_file_locally(file, parent)?;
+        let drive_file = file
+            .drive_file
+            .as_ref()
+            .ok_or_else(|| err_msg("Cannot create a file without Drive metadata"))?;
+        let drive_id = self.df.create(drive_file)?;
+        file.set_drive_id(drive_id.clone());
+        if let Err(local_error) = self.add_file_locally(file, parent) {
+            return match self.df.delete_permanently(&drive_id) {
+                Ok(true) => Err(local_error),
+                Ok(false) => Err(err_msg(format!(
+                    "Could not add new file locally and Drive did not confirm cleanup: {}",
+                    local_error
+                ))),
+                Err(cleanup_error) => Err(err_msg(format!(
+                    "Could not add new file locally ({}) or clean it up on Drive ({})",
+                    local_error, cleanup_error
+                ))),
+            };
+        }
 
         Ok(())
     }
@@ -421,6 +428,11 @@ impl FileManager {
             .get_drive_id(id)
             .ok_or_else(|| err_msg(format!("Cannot find drive id of {:?}", id)))?;
         self.df.flush(&file)
+    }
+
+    /// Flushes all staged file content to Drive.
+    pub fn flush_all(&mut self) -> Result<(), Error> {
+        self.df.flush_all()
     }
 
     /// Adds a file to the local file tree. Does not communicate with Drive.
@@ -550,17 +562,31 @@ impl FileManager {
         let node_id = self
             .get_node_id(id)
             .ok_or_else(|| err_msg(format!("Cannot find node_id of {:?}", id)))?;
-        let inode = self
-            .get_inode(id)
-            .ok_or_else(|| err_msg(format!("Cannot find inode of {:?}", id)))?;
-        let drive_id = self
-            .get_drive_id(id)
-            .ok_or_else(|| err_msg(format!("Cannot find drive id of {:?}", id)))?;
+        let old_parent = self.get_parent_inode(id);
+        let inodes: Vec<Inode> = self
+            .tree
+            .traverse_pre_order(&node_id)?
+            .map(|node| *node.data())
+            .collect();
+        let drive_ids: Vec<DriveId> = inodes
+            .iter()
+            .filter_map(|inode| self.files.get(inode).and_then(File::drive_id))
+            .collect();
 
         self.tree.remove_node(node_id, DropChildren)?;
-        self.files.remove(&inode);
-        self.node_ids.remove(&inode);
-        self.drive_ids.remove(&drive_id);
+        for inode in inodes {
+            self.files.remove(&inode);
+            self.node_ids.remove(&inode);
+        }
+        for drive_id in drive_ids {
+            self.drive_ids.remove(&drive_id);
+            self.df.discard_file_state(&drive_id);
+        }
+        if self.rename_identical_files
+            && let Some(old_parent) = old_parent
+        {
+            self.recalculate_duplicate_suffixes_for_parent(old_parent);
+        }
 
         Ok(())
     }
@@ -571,12 +597,12 @@ impl FileManager {
             .get_drive_id(id)
             .ok_or_else(|| err_msg("No such file"))?;
 
-        self.delete_locally(id)?;
         match self.df.delete_permanently(&drive_id) {
-            Ok(response) => {
-                debug!("{:?}", response);
+            Ok(true) => {
+                self.delete_locally(id)?;
                 Ok(())
             }
+            Ok(false) => Err(err_msg("Drive did not confirm permanent deletion")),
             Err(e) => Err(err_msg(format!("{}", e))),
         }
     }
@@ -602,16 +628,17 @@ impl FileManager {
             .and_then(|parent_node_id| self.tree.get(parent_node_id).ok())
             .map(|parent_node| *parent_node.data());
 
+        if also_on_drive {
+            self.df.flush(&drive_id)?;
+            self.df.move_to_trash(drive_id.clone())?;
+        }
+
         self.tree.move_node(&node_id, ToParent(&trash_id))?;
 
-        // File cannot be identified by FileId::ParentAndName now because the parent has changed.
-        // Using DriveId instead.
-        if also_on_drive {
-            self.get_mut_file(&FileId::DriveId(drive_id.clone()))
-                .ok_or_else(|| err_msg(format!("Cannot find {:?}", drive_id)))?
-                .set_trashed(true)?;
-            self.df.move_to_trash(drive_id)?;
-        }
+        // File cannot be identified by parent and name after moving it.
+        self.get_mut_file(&FileId::DriveId(drive_id.clone()))
+            .ok_or_else(|| err_msg(format!("Cannot find {:?}", drive_id)))?
+            .set_trashed(true)?;
 
         // Recalculate suffixes for both old parent and Trash directories
         if self.rename_identical_files {
@@ -657,25 +684,6 @@ impl FileManager {
             .get_node_id(&FileId::Inode(new_parent))
             .ok_or_else(|| err_msg("Target node doesn't exist"))?;
 
-        self.tree.move_node(&current_node, ToParent(&target_node))?;
-
-        // Update the file's name
-        {
-            let file = self
-                .get_mut_file(&id)
-                .ok_or_else(|| err_msg("File doesn't exist"))?;
-            file.name = new_name.clone();
-            file.identical_name_id = None; // Will be recalculated below if needed
-        }
-
-        // Recalculate suffixes for both old and new parent directories
-        if self.rename_identical_files {
-            if let Some(old_parent_inode) = old_parent {
-                self.recalculate_duplicate_suffixes_for_parent(old_parent_inode);
-            }
-            self.recalculate_duplicate_suffixes_for_parent(new_parent);
-        }
-
         let drive_id = self
             .get_drive_id(&id)
             .ok_or_else(|| err_msg(format!("Cannot find drive_id of {:?}", id)))?;
@@ -690,31 +698,95 @@ impl FileManager {
 
         debug!("parent_id: {}", parent_id);
         self.df.move_to(&drive_id, &parent_id, &new_name)?;
+
+        self.tree.move_node(&current_node, ToParent(&target_node))?;
+
+        let file = self
+            .get_mut_file(&id)
+            .ok_or_else(|| err_msg("File doesn't exist"))?;
+        file.name = new_name;
+        file.identical_name_id = None;
+
+        if self.rename_identical_files {
+            if let Some(old_parent_inode) = old_parent {
+                self.recalculate_duplicate_suffixes_for_parent(old_parent_inode);
+            }
+            self.recalculate_duplicate_suffixes_for_parent(new_parent);
+        }
+
         Ok(())
     }
 
     /// Writes to a file locally *and* on Drive. Note: the pending write is not necessarily applied
     /// instantly by the `DriveFacade`.
-    pub fn write(&mut self, id: FileId, offset: usize, data: &[u8]) {
-        let drive_id = self.get_drive_id(&id).unwrap();
-        self.df.write(drive_id, offset, data);
+    pub fn write(&mut self, id: &FileId, offset: usize, data: &[u8]) -> Result<(), Error> {
+        let drive_id = self
+            .get_drive_id(id)
+            .ok_or_else(|| err_msg(format!("Cannot find drive id of {:?}", id)))?;
+        self.df.write(drive_id, offset, data)
+    }
+
+    /// Writes data to a file and persists it before returning.
+    pub fn write_and_flush(
+        &mut self,
+        id: &FileId,
+        offset: usize,
+        data: &[u8],
+    ) -> Result<(), Error> {
+        let drive_id = self
+            .get_drive_id(id)
+            .ok_or_else(|| err_msg(format!("Cannot find drive id of {:?}", id)))?;
+        self.df.write_and_flush(drive_id, offset, data)
+    }
+
+    /// Changes a file's length and persists it before returning.
+    pub fn truncate(&mut self, id: &FileId, size: usize) -> Result<(), Error> {
+        let drive_id = self
+            .get_drive_id(id)
+            .ok_or_else(|| err_msg(format!("Cannot find drive id of {:?}", id)))?;
+        self.df.truncate_and_flush(drive_id, size)
+    }
+
+    /// Renames a file and moves it into the virtual Trash directory.
+    pub fn rename_and_move_to_trash(&mut self, id: &FileId, new_name: String) -> Result<(), Error> {
+        let node_id = self
+            .get_node_id(id)
+            .ok_or_else(|| err_msg(format!("Cannot find node_id of {:?}", id)))?;
+        let trash_id = self
+            .get_node_id(&FileId::Inode(TRASH_INODE))
+            .ok_or_else(|| err_msg("Cannot find node_id of Trash dir"))?;
+        let old_parent = self.get_parent_inode(id);
+        let drive_id = self
+            .get_drive_id(id)
+            .ok_or_else(|| err_msg(format!("Cannot find drive_id of {:?}", id)))?;
+
+        self.df.flush(&drive_id)?;
+        self.df.move_to_trash_with_name(&drive_id, &new_name)?;
+        self.tree.move_node(&node_id, ToParent(&trash_id))?;
+
+        let file = self
+            .get_mut_file(&FileId::DriveId(drive_id))
+            .ok_or_else(|| err_msg("File disappeared after moving it to Trash"))?;
+        file.name = new_name;
+        file.identical_name_id = None;
+        file.set_trashed(true)?;
+
+        if self.rename_identical_files {
+            if let Some(old_parent) = old_parent {
+                self.recalculate_duplicate_suffixes_for_parent(old_parent);
+            }
+            self.recalculate_duplicate_suffixes_for_parent(TRASH_INODE);
+        }
+
+        Ok(())
     }
 
     #[cfg(test)]
     /// Create a FileManager with manual state for testing (no Drive API calls).
     /// This bypasses the normal constructor which makes Drive API calls during initialization.
     ///
-    /// WARNING: The DriveFacade field is uninitialized and will leak if the FileManager is dropped.
-    /// This is only safe because test methods don't call DriveFacade methods.
-    /// Use std::mem::forget() on the FileManager after tests to avoid undefined behavior on drop.
-    #[allow(unsafe_code, invalid_value, clippy::uninit_assumed_init)]
     pub fn new_for_testing(rename_identical_files: bool) -> Self {
-        use std::mem::MaybeUninit;
-
-        // SAFETY: DriveFacade will never be accessed in tests, so it's safe to leave uninitialized.
-        // Test methods only use the tree, files, and mapping fields.
-        // IMPORTANT: The returned FileManager should not be dropped normally - use std::mem::forget()
-        let df = unsafe { MaybeUninit::uninit().assume_init() };
+        let df = DriveFacade::new_for_testing();
 
         let mut tree = TreeBuilder::new().with_node_capacity(500).build();
         let mut files = HashMap::new();
@@ -724,7 +796,7 @@ impl FileManager {
         let root_file = File {
             name: "/".to_string(),
             attr: FileAttr {
-                ino: ROOT_INODE,
+                ino: INodeNo(ROOT_INODE),
                 size: 512,
                 blocks: 1,
                 blksize: 512,
@@ -816,5 +888,85 @@ impl fmt::Debug for FileManager {
         }
 
         writeln!(f, ")")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FileManager, ROOT_INODE};
+    use crate::gcsf::{File, FileId};
+    use fuser::{FileAttr, FileType, INodeNo};
+    use std::time::SystemTime;
+
+    fn file(name: &str, inode: u64, drive_id: &str, kind: FileType) -> File {
+        File {
+            name: name.to_string(),
+            attr: FileAttr {
+                ino: INodeNo(inode),
+                size: 0,
+                blocks: 0,
+                atime: SystemTime::UNIX_EPOCH,
+                mtime: SystemTime::UNIX_EPOCH,
+                ctime: SystemTime::UNIX_EPOCH,
+                crtime: SystemTime::UNIX_EPOCH,
+                kind,
+                perm: 0o755,
+                nlink: 1,
+                uid: 0,
+                gid: 0,
+                rdev: 0,
+                blksize: 512,
+                flags: 0,
+            },
+            identical_name_id: None,
+            drive_file: Some(drive3::api::File {
+                id: Some(drive_id.to_string()),
+                name: Some(name.to_string()),
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn deleting_directory_cleans_descendant_indexes() {
+        let mut manager = FileManager::new_for_testing(false);
+        manager
+            .add_test_file(file("dir", 10, "dir-id", FileType::Directory), ROOT_INODE)
+            .unwrap();
+        manager
+            .add_test_file(file("child", 11, "child-id", FileType::RegularFile), 10)
+            .unwrap();
+
+        manager.delete_locally(&FileId::Inode(10)).unwrap();
+
+        for inode in [10, 11] {
+            assert!(!manager.contains(&FileId::Inode(inode)));
+            assert!(!manager.files.contains_key(&inode));
+            assert!(!manager.node_ids.contains_key(&inode));
+        }
+        for drive_id in ["dir-id", "child-id"] {
+            assert!(!manager.contains(&FileId::DriveId(drive_id.to_string())));
+            assert!(!manager.drive_ids.contains_key(drive_id));
+        }
+    }
+
+    #[test]
+    fn deleting_duplicate_recalculates_survivor_suffix() {
+        let mut manager = FileManager::new_for_testing(true);
+        manager
+            .add_test_file(file("same", 10, "a-id", FileType::RegularFile), ROOT_INODE)
+            .unwrap();
+        manager
+            .add_test_file(file("same", 11, "b-id", FileType::RegularFile), ROOT_INODE)
+            .unwrap();
+        manager.recalculate_duplicate_suffixes_for_parent(ROOT_INODE);
+        assert_eq!(
+            manager.get_file(&FileId::Inode(11)).unwrap().name(),
+            "same.1"
+        );
+
+        manager.delete_locally(&FileId::Inode(10)).unwrap();
+
+        assert_eq!(manager.get_file(&FileId::Inode(11)).unwrap().name(), "same");
     }
 }

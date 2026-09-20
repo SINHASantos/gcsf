@@ -15,7 +15,7 @@ clap = { version = "4.6.7", features = ["derive"] }
 config = "0.15.25"
 ctrlc = "3.5.2"
 failure = "0.1.8"
-fuser = { version = "0.16", features = ["libfuse"] }
+fuser = { version = "0.18", features = ["libfuse"] }
 futures = {version =  "0.3.34", features = ["executor"]}
 google-drive3 = "=7.0.0"
 # google-drive3 7.0.0 depends on yup-oauth2 with default features disabled, which

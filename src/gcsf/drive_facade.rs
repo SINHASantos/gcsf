@@ -25,13 +25,18 @@ type DriveHub =
 /// Provides a simple high-level interface for interacting with the Google Drive API.
 pub struct DriveFacade {
     /// The `drive3::DriveHub` used for interacting with the API.
+    #[cfg(not(test))]
     pub hub: DriveHub,
+
+    /// The optional Drive client used by offline unit tests.
+    #[cfg(test)]
+    pub hub: Option<DriveHub>,
 
     /// A buffer used for temporarily caching read blocks. Storing this inside the struct makes it possible to return a reference to the data without the danger of the data outliving the struct.
     buff: Vec<u8>,
 
     /// Maps Drive IDs to a list of pending write operations that must be applied on them.
-    pending_writes: HashMap<DriveId, Vec<PendingWrite>>,
+    pending_writes: HashMap<DriveId, Vec<PendingOperation>>,
 
     /// The LRU cache used for storing the file contents for any given Drive ID.
     cache: LruCache<DriveId, Vec<u8>>,
@@ -45,11 +50,20 @@ pub struct DriveFacade {
 
 /// Represents a write operation that has been performed from the user's point of view but has not
 /// yet been applied to the local or remote file.
-#[derive(Debug)]
-struct PendingWrite {
-    id: DriveId,
-    offset: usize,
-    data: Vec<u8>,
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PendingOperation {
+    Write { offset: usize, data: Vec<u8> },
+    Truncate { size: usize },
+}
+
+struct FlushFailure {
+    error: Error,
+    outcome_indeterminate: bool,
+}
+
+enum UpdateFileError {
+    BeforeUpload(Error),
+    Drive(Box<drive3::Error>),
 }
 
 lazy_static! {
@@ -96,6 +110,14 @@ fn error_messages(error: &drive3::Error) -> Vec<String> {
     error_details(error, "message")
 }
 
+fn is_not_found(error: &drive3::Error) -> bool {
+    match error {
+        drive3::Error::Failure(response) => response.status() == hyper::StatusCode::NOT_FOUND,
+        drive3::Error::BadRequest(body) => body["error"]["code"].as_u64() == Some(404),
+        _ => false,
+    }
+}
+
 fn error_details(error: &drive3::Error, field: &str) -> Vec<String> {
     let drive3::Error::BadRequest(body) = error else {
         return Vec::new();
@@ -122,13 +144,40 @@ impl DriveFacade {
         let max_count = config.cache_max_items() as usize;
 
         DriveFacade {
+            #[cfg(not(test))]
             hub: DriveFacade::create_drive(config).unwrap(),
+            #[cfg(test)]
+            hub: Some(DriveFacade::create_drive(config).unwrap()),
             buff: Vec::new(),
             pending_writes: HashMap::new(),
             cache: LruCache::<String, Vec<u8>>::with_expiry_duration_and_capacity(ttl, max_count),
             root_id: None,
             changes_token: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_testing() -> Self {
+        Self {
+            hub: None,
+            buff: Vec::new(),
+            pending_writes: HashMap::new(),
+            cache: LruCache::with_capacity(10),
+            changes_token: None,
+            root_id: None,
+        }
+    }
+
+    #[cfg(not(test))]
+    fn hub(&self) -> Result<&DriveHub, Error> {
+        Ok(&self.hub)
+    }
+
+    #[cfg(test)]
+    fn hub(&self) -> Result<&DriveHub, Error> {
+        self.hub
+            .as_ref()
+            .ok_or_else(|| err_msg("Drive client is unavailable"))
     }
 
     /// Creates a Drive authenticator.
@@ -181,7 +230,7 @@ impl DriveFacade {
     fn contains(&self, id: DriveIdRef) -> Result<bool, Error> {
         let rt = Runtime::new().unwrap();
         let response = rt.block_on(
-            self.hub
+            self.hub()?
                 .files()
                 .get(id)
                 .add_scope(drive3::api::Scope::Full)
@@ -190,6 +239,7 @@ impl DriveFacade {
 
         match response {
             Ok((_, file)) => Ok(file.id == Some(id.to_string())),
+            Err(error) if is_not_found(&error) => Ok(false),
             Err(e) => Err(err_msg(format!("{:#?}", e))),
         }
     }
@@ -202,7 +252,7 @@ impl DriveFacade {
     fn get_file_metadata(&self, id: DriveIdRef) -> Result<drive3::api::File, Error> {
         let rt = Runtime::new().unwrap();
         rt.block_on(
-            self.hub
+            self.hub()?
                 .files()
                 .get(id)
                 .param("fields", "id,name,parents,mimeType,webViewLink")
@@ -258,7 +308,7 @@ impl DriveFacade {
         let response = match export_type {
             Some(t) => {
                 let result = rt.block_on(
-                    self.hub
+                    self.hub()?
                         .files()
                         .export(drive_id, t)
                         .add_scope(drive3::api::Scope::Full)
@@ -279,7 +329,11 @@ impl DriveFacade {
                             .iter()
                             .any(|reason| PERMANENT_EXPORT_FAILURES.contains(reason.as_str())) =>
                     {
-                        warn!("Cannot export {}: {}", drive_id, error_messages(e).join("; "));
+                        warn!(
+                            "Cannot export {}: {}",
+                            drive_id,
+                            error_messages(e).join("; ")
+                        );
                         return Ok(self.unexportable_placeholder(
                             drive_id,
                             &format!(
@@ -295,7 +349,7 @@ impl DriveFacade {
             None => {
                 let (response, _empty_file) = rt
                     .block_on(
-                        self.hub
+                        self.hub()?
                             .files()
                             .get(drive_id)
                             .supports_team_drives(false)
@@ -315,32 +369,52 @@ impl DriveFacade {
         Ok(content)
     }
 
-    /// Applies all pending writes accumulated so far on a data buffer. The pending writes are then
-    /// cleared.
-    fn apply_pending_writes_on_data(&mut self, id: DriveId, data: &mut Vec<u8>) {
-        self.pending_writes
-            .entry(id.clone())
-            .or_default()
-            .iter()
-            .filter(|write| write.id == id)
-            .for_each(|pending_write| {
-                debug!(
-                    "Applying pending write with offset {} on {}",
-                    pending_write.offset, pending_write.id
-                );
-                let required_size = pending_write.offset + pending_write.data.len();
+    fn apply_pending_operations(
+        operations: &[PendingOperation],
+        data: &mut Vec<u8>,
+    ) -> Result<(), Error> {
+        for operation in operations {
+            match operation {
+                PendingOperation::Write {
+                    offset,
+                    data: write_data,
+                } => {
+                    let required_size = offset
+                        .checked_add(write_data.len())
+                        .ok_or_else(|| err_msg("Write offset overflow"))?;
+                    Self::grow_data(data, required_size)?;
+                    data[*offset..required_size].copy_from_slice(write_data);
+                }
+                PendingOperation::Truncate { size } => Self::resize_data(data, *size)?,
+            }
+        }
+        Ok(())
+    }
 
-                // NOTE: this truncates whenever the write ends before the current
-                // end of the buffer, so a partial write drops the rest of the file.
-                // It is nonetheless load-bearing: setattr() only records the new
-                // size in the inode attributes and never touches the content, so
-                // this resize is the only thing implementing O_TRUNC. Making writes
-                // grow-only requires implementing truncation for real first.
-                data.resize(required_size, 0);
-                data[pending_write.offset..].copy_from_slice(&pending_write.data[..]);
-            });
+    fn grow_data(data: &mut Vec<u8>, size: usize) -> Result<(), Error> {
+        if size > data.len() {
+            data.try_reserve(size - data.len())
+                .map_err(|error| err_msg(format!("Could not grow file buffer: {}", error)))?;
+            data.resize(size, 0);
+        }
+        Ok(())
+    }
 
-        self.pending_writes.remove(&id);
+    fn resize_data(data: &mut Vec<u8>, size: usize) -> Result<(), Error> {
+        Self::grow_data(data, size)?;
+        data.resize(size, 0);
+        Ok(())
+    }
+
+    fn data_with_pending_operations(
+        &self,
+        id: DriveIdRef,
+        mut data: Vec<u8>,
+    ) -> Result<Vec<u8>, Error> {
+        if let Some(operations) = self.pending_writes.get(id) {
+            Self::apply_pending_operations(operations, &mut data)?;
+        }
+        Ok(data)
     }
 
     /// Validates that the current authentication is working.
@@ -356,7 +430,7 @@ impl DriveFacade {
             let rt = Runtime::new().unwrap();
             let parent = rt
                 .block_on(
-                    self.hub
+                    self.hub()?
                         .files()
                         .list()
                         .param("fields", "files(parents)")
@@ -395,20 +469,19 @@ impl DriveFacade {
     /// Returns the start page token for the `changes.list` API endpoint.
     fn get_start_page_token(&mut self) -> Result<String, Error> {
         let rt = Runtime::new().unwrap();
-        rt.block_on(
-            self.hub
-                .changes()
-                .get_start_page_token()
-                .add_scope(drive3::api::Scope::Full)
-                .doit(),
-        )
-        .map_err(|e| err_msg(format!("{:#?}", e)))
-        .map(|result| {
-            result.1.start_page_token.unwrap_or_else(|| {
-                err_msg("Received OK response from drive but there is no startPageToken included.")
-                    .to_string()
-            })
-        })
+        let result = rt
+            .block_on(
+                self.hub()?
+                    .changes()
+                    .get_start_page_token()
+                    .add_scope(drive3::api::Scope::Full)
+                    .doit(),
+            )
+            .map_err(|e| err_msg(format!("{:#?}", e)))?;
+        result
+            .1
+            .start_page_token
+            .ok_or_else(|| err_msg("Received OK response from Drive without a startPageToken"))
     }
 
     /// Returns the current token for the `changes.list` API endpoint, or the start page token if
@@ -423,21 +496,21 @@ impl DriveFacade {
 
     /// Returns a list of all changes reported by Drive which are more recent than the changes
     /// token indicates.
-    pub fn get_all_changes(&mut self) -> Result<Vec<drive3::api::Change>, Error> {
+    pub fn get_all_changes(&mut self) -> Result<(Vec<drive3::api::Change>, String), Error> {
         let mut all_changes = Vec::new();
+        let mut token = self.changes_token()?.clone();
 
         let rt = Runtime::new().unwrap();
 
         loop {
-            let token = self.changes_token()?.clone();
-            let (_response, changelist) = rt.block_on(self.hub
+            let (_response, changelist) = rt.block_on(self.hub()?
                 .changes()
                 .list(&token)
                 .param("fields", "kind,newStartPageToken,changes(kind,type,time,removed,fileId,file(name,id,size,mimeType,owners,parents,trashed,modifiedTime,createdTime,viewedByMeTime))")
                 .spaces("drive")
                 .restrict_to_my_drive(true)
                 // Whether to include changes indicating that items have been removed from the list of changes, for example by deletion or loss of access. (Default: true)
-                .include_removed(false) // ^wtf?
+                .include_removed(true)
                 .supports_team_drives(false)
                 .include_team_drive_items(false)
                 .page_size(PAGE_SIZE)
@@ -450,14 +523,20 @@ impl DriveFacade {
                 _ => warn!("Changelist does not contain any changes!"),
             };
 
-            self.changes_token = changelist.next_page_token;
-            if self.changes_token.is_none() {
-                self.changes_token = changelist.new_start_page_token;
-                break;
+            if let Some(next_page_token) = changelist.next_page_token {
+                token = next_page_token;
+            } else {
+                let new_start_page_token = changelist.new_start_page_token.ok_or_else(|| {
+                    err_msg("Drive returned a final changes page without a new start page token")
+                })?;
+                return Ok((all_changes, new_start_page_token));
             }
         }
+    }
 
-        Ok(all_changes)
+    /// Advances the Drive changes cursor after the caller applies the fetched batch locally.
+    pub fn commit_changes_token(&mut self, token: String) {
+        self.changes_token = Some(token);
     }
 
     /// Returns a list of all files from Drive. If the `parents` list is provided, only files which are children of any one of the list's elements are returned. If `trashed` is provided, only files which are trashed/not trashed are returned. The two filters can be used together.
@@ -471,7 +550,7 @@ impl DriveFacade {
         let mut current_page = 1;
         let rt = Runtime::new().unwrap();
         loop {
-            let mut request = self.hub.files()
+            let mut request = self.hub()?.files()
                 .list()
                 .param("fields", "nextPageToken,files(name,id,size,mimeType,owners,parents,trashed,modifiedTime,createdTime,viewedByMeTime)")
                 .spaces("drive") // TODO: maybe add photos as well
@@ -532,18 +611,23 @@ impl DriveFacade {
         offset: usize,
         size: usize,
     ) -> Option<&[u8]> {
-        if self.cache.contains_key(drive_id) {
-            let data = self.cache.get(drive_id).unwrap();
-            self.buff =
-                data[cmp::min(data.len(), offset)..cmp::min(data.len(), offset + size)].to_vec();
-            return Some(&self.buff);
-        }
+        let data = match self.cache.get(drive_id).cloned() {
+            Some(data) => data,
+            None => match self.get_file_content(drive_id, mime_type) {
+                Ok(data) => data,
+                Err(e) => {
+                    error!("Got error: {:?}", e);
+                    return None;
+                }
+            },
+        };
 
-        match self.get_file_content(drive_id, mime_type) {
+        match self.data_with_pending_operations(drive_id, data) {
             Ok(data) => {
-                self.buff = data[cmp::min(data.len(), offset)..cmp::min(data.len(), offset + size)]
-                    .to_vec();
-                self.cache.insert(drive_id.to_string(), data.to_vec());
+                let start = cmp::min(data.len(), offset);
+                let end = cmp::min(data.len(), offset.saturating_add(size));
+                self.buff = data[start..end].to_vec();
+                self.cache.insert(drive_id.to_string(), data);
                 Some(&self.buff)
             }
             Err(e) => {
@@ -558,7 +642,7 @@ impl DriveFacade {
         let dummy_file = DummyFile::new(&[]);
         let rt = Runtime::new().unwrap();
         rt.block_on(
-            self.hub
+            self.hub()?
                 .files()
                 .create(drive_file.clone())
                 .use_content_as_indexable_text(true)
@@ -567,19 +651,20 @@ impl DriveFacade {
                 .upload(dummy_file, "application/octet-stream".parse().unwrap()),
         )
         .map_err(|e| err_msg(format!("{:#?}", e)))
-        .map(|(_, file)| {
-            file.id.unwrap_or_else(|| {
-                err_msg("Received file from drive but it has no drive id.").to_string()
-            })
+        .and_then(|(_, file)| {
+            file.id
+                .ok_or_else(|| err_msg("Received file from Drive without an id"))
         })
     }
 
     /// Writes some data to a Drive file starting at a certain offset.
     /// This is a lazy operation. It creates a pending write which only gets executed when flush()
     /// is called.
-    pub fn write(&mut self, id: DriveId, offset: usize, data: &[u8]) {
-        let pending_write = PendingWrite {
-            id: id.clone(),
+    pub fn write(&mut self, id: DriveId, offset: usize, data: &[u8]) -> Result<(), Error> {
+        offset
+            .checked_add(data.len())
+            .ok_or_else(|| err_msg("Write offset overflow"))?;
+        let pending_write = PendingOperation::Write {
             offset,
             data: data.to_vec(),
         };
@@ -588,21 +673,83 @@ impl DriveFacade {
             .entry(id)
             .or_insert_with(|| Vec::with_capacity(3000))
             .push(pending_write);
+        Ok(())
+    }
+
+    /// Writes data and persists it before returning.
+    pub fn write_and_flush(
+        &mut self,
+        id: DriveId,
+        offset: usize,
+        data: &[u8],
+    ) -> Result<(), Error> {
+        offset
+            .checked_add(data.len())
+            .ok_or_else(|| err_msg("Write offset overflow"))?;
+        let operation_index = self.pending_writes.get(&id).map_or(0, Vec::len);
+        self.write(id.clone(), offset, data)?;
+        match self.flush_inner(&id) {
+            Ok(()) => Ok(()),
+            Err(failure) => {
+                if !failure.outcome_indeterminate {
+                    self.remove_pending_operation(&id, operation_index);
+                }
+                Err(failure.error)
+            }
+        }
+    }
+
+    /// Changes the file length when the pending operations are next flushed.
+    pub fn truncate(&mut self, id: DriveId, size: usize) {
+        self.pending_writes
+            .entry(id)
+            .or_insert_with(|| Vec::with_capacity(3000))
+            .push(PendingOperation::Truncate { size });
+    }
+
+    /// Truncates a file and persists the new length before returning.
+    pub fn truncate_and_flush(&mut self, id: DriveId, size: usize) -> Result<(), Error> {
+        let operation_index = self.pending_writes.get(&id).map_or(0, Vec::len);
+        self.truncate(id.clone(), size);
+        match self.flush_inner(&id) {
+            Ok(()) => Ok(()),
+            Err(failure) => {
+                if !failure.outcome_indeterminate {
+                    self.remove_pending_operation(&id, operation_index);
+                }
+                Err(failure.error)
+            }
+        }
+    }
+
+    fn remove_pending_operation(&mut self, id: DriveIdRef, operation_index: usize) {
+        if let Some(operations) = self.pending_writes.get_mut(id)
+            && operations.len() > operation_index
+        {
+            operations.remove(operation_index);
+            if operations.is_empty() {
+                self.pending_writes.remove(id);
+            }
+        }
     }
 
     /// Deletes a file permanently from Drive.
     pub fn delete_permanently(&mut self, id: DriveIdRef) -> Result<bool, Error> {
         let rt = Runtime::new().unwrap();
-        rt.block_on(
-            self.hub
+        match rt.block_on(
+            self.hub()?
                 .files()
                 .delete(id)
                 .supports_team_drives(false)
                 .add_scope(drive3::api::Scope::Full)
                 .doit(),
-        )
-        .map(|response| response.status().is_success())
-        .map_err(|e| err_msg(format!("{:#?}", e)))
+        ) {
+            Ok(response) => Ok(response.status().is_success()),
+            Err(delete_error) => match self.contains(id) {
+                Ok(false) => Ok(true),
+                _ => Err(err_msg(format!("{:#?}", delete_error))),
+            },
+        }
     }
 
     /// `mv` operation. Can potentially move a file to a new directory and/or rename it.
@@ -630,7 +777,7 @@ impl DriveFacade {
         };
         let rt = Runtime::new().unwrap();
         rt.block_on(
-            self.hub
+            self.hub()?
                 .files()
                 .update(f, id)
                 .remove_parents(&current_parents)
@@ -650,7 +797,7 @@ impl DriveFacade {
 
         let rt = Runtime::new().unwrap();
         rt.block_on(
-            self.hub
+            self.hub()?
                 .files()
                 .update(f, &id)
                 .add_scope(drive3::api::Scope::Full)
@@ -660,35 +807,118 @@ impl DriveFacade {
         .map_err(|e| err_msg(format!("DriveFacade::move_to_trash() {}", e)))
     }
 
+    /// Renames a file and marks it as trashed in one Drive update.
+    pub fn move_to_trash_with_name(&mut self, id: DriveIdRef, new_name: &str) -> Result<(), Error> {
+        let file = drive3::api::File {
+            name: Some(new_name.to_string()),
+            trashed: Some(true),
+            ..Default::default()
+        };
+
+        let rt = Runtime::new().unwrap();
+        rt.block_on(
+            self.hub()?
+                .files()
+                .update(file, id)
+                .add_scope(drive3::api::Scope::Full)
+                .doit_without_upload(),
+        )
+        .map(|_| ())
+        .map_err(|error| err_msg(format!("DriveFacade::move_to_trash_with_name() {}", error)))
+    }
+
     /// Applies pending write operations. Similar to flushing a stream.
     pub fn flush(&mut self, id: DriveIdRef) -> Result<(), Error> {
+        self.flush_inner(id).map_err(|failure| failure.error)
+    }
+
+    fn flush_inner(&mut self, id: DriveIdRef) -> Result<(), FlushFailure> {
         if !self.pending_writes.contains_key(id) {
             debug!("flush({}): no pending writes", id);
             return Ok(());
         }
-        self.cache.remove(id);
-
         if let Ok(false) = self.contains(id) {
-            return Err(err_msg(format!(
-                "flush({}): file doesn't exist on drive!",
-                id
-            )));
+            return Err(FlushFailure {
+                error: err_msg(format!("flush({}): file doesn't exist on drive!", id)),
+                outcome_indeterminate: false,
+            });
         }
 
         // Pending writes are patches applied on top of the current content, so a
         // failure to fetch it must abort the flush. Defaulting to an empty buffer
         // here would upload the patches alone, discarding everything else the file
         // holds on Drive. The pending writes are left in place for a later retry.
-        let mut file_data = self.get_file_content(id, None).map_err(|e| {
-            err_msg(format!(
-                "flush({}): refusing to overwrite, could not fetch current content: {}",
-                id, e
-            ))
-        })?;
-        self.apply_pending_writes_on_data(DriveId::from(id), &mut file_data);
-        self.update_file_content(DriveId::from(id), &file_data)?;
+        let file_data = self
+            .get_file_content(id, None)
+            .map_err(|error| FlushFailure {
+                error: err_msg(format!(
+                    "flush({}): refusing to overwrite, could not fetch current content: {}",
+                    id, error
+                )),
+                outcome_indeterminate: false,
+            })?;
+        let file_data = self
+            .data_with_pending_operations(id, file_data)
+            .map_err(|error| FlushFailure {
+                error,
+                outcome_indeterminate: false,
+            })?;
+        self.update_file_content(DriveId::from(id), &file_data)
+            .map_err(|error| match error {
+                UpdateFileError::BeforeUpload(error) => FlushFailure {
+                    error,
+                    outcome_indeterminate: false,
+                },
+                UpdateFileError::Drive(error) => FlushFailure {
+                    outcome_indeterminate: Self::upload_outcome_is_indeterminate(&error),
+                    error: err_msg(format!("{:#?}", error)),
+                },
+            })?;
+        self.pending_writes.remove(id);
+        self.cache.insert(id.to_string(), file_data);
 
         Ok(())
+    }
+
+    fn upload_outcome_is_indeterminate(error: &drive3::Error) -> bool {
+        match error {
+            drive3::Error::HttpError(_)
+            | drive3::Error::JsonDecodeError(_, _)
+            | drive3::Error::Io(_) => true,
+            drive3::Error::Failure(response) => response.status().is_server_error(),
+            drive3::Error::UploadSizeLimitExceeded(_, _)
+            | drive3::Error::BadRequest(_)
+            | drive3::Error::MissingAPIKey
+            | drive3::Error::MissingToken(_)
+            | drive3::Error::Cancelled
+            | drive3::Error::FieldClash(_) => false,
+        }
+    }
+
+    /// Flushes every file with staged content, retaining failed operations for retry.
+    pub fn flush_all(&mut self) -> Result<(), Error> {
+        let ids: Vec<DriveId> = self.pending_writes.keys().cloned().collect();
+        let mut failures = Vec::new();
+        for id in ids {
+            if let Err(error) = self.flush(&id) {
+                failures.push(format!("{}: {}", id, error));
+            }
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(err_msg(format!(
+                "Could not flush all pending writes: {}",
+                failures.join("; ")
+            )))
+        }
+    }
+
+    /// Discards cached and staged content after a file has been permanently deleted.
+    pub fn discard_file_state(&mut self, id: DriveIdRef) {
+        self.pending_writes.remove(id);
+        self.cache.remove(id);
     }
 
     /// Updates the content of a file on Drive. The MIME type is guessed appropriately based on the
@@ -702,7 +932,7 @@ impl DriveFacade {
             Response<http_body_util::combinators::BoxBody<bytes::Bytes, hyper::Error>>,
             drive3::api::File,
         ),
-        Error,
+        UpdateFileError,
     > {
         let mime_guess = data.sniff_mime_type().unwrap_or("application/octet-stream");
         debug!(
@@ -716,14 +946,18 @@ impl DriveFacade {
         };
 
         let rt = Runtime::new().unwrap();
-        rt.block_on(
-            self.hub
-                .files()
-                .update(file, &id)
-                .add_scope(drive3::api::Scope::Full)
-                .upload_resumable(DummyFile::new(data), mime_guess.parse().unwrap()),
-        )
-        .map_err(|e| err_msg(format!("{:#?}", e)))
+        let request = self
+            .hub()
+            .map_err(UpdateFileError::BeforeUpload)?
+            .files()
+            .update(file, &id)
+            .add_scope(drive3::api::Scope::Full);
+        let result = if data.is_empty() {
+            rt.block_on(request.upload(DummyFile::new(data), mime_guess.parse().unwrap()))
+        } else {
+            rt.block_on(request.upload_resumable(DummyFile::new(data), mime_guess.parse().unwrap()))
+        };
+        result.map_err(|error| UpdateFileError::Drive(Box::new(error)))
     }
 
     /// Returns the size and capacity of the Drive account. In some cases, the limit can be absent.
@@ -731,7 +965,7 @@ impl DriveFacade {
         let rt = Runtime::new().unwrap();
         let (_response, about) = rt
             .block_on(
-                self.hub
+                self.hub()?
                     .about()
                     .get()
                     .param("fields", "storageQuota")
@@ -803,5 +1037,147 @@ impl Read for DummyFile {
 
         self.cursor += copied as u64;
         Ok(copied)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DriveFacade, PendingOperation, is_not_found};
+
+    fn write(offset: usize, data: &[u8]) -> PendingOperation {
+        PendingOperation::Write {
+            offset,
+            data: data.to_vec(),
+        }
+    }
+
+    #[test]
+    fn recognizes_json_not_found_errors() {
+        let error = drive3::Error::BadRequest(serde_json::json!({
+            "error": { "code": 404 }
+        }));
+        assert!(is_not_found(&error));
+    }
+
+    #[test]
+    fn partial_write_preserves_existing_suffix() {
+        let mut data = b"abcdefghij".to_vec();
+        DriveFacade::apply_pending_operations(&[write(2, b"XY")], &mut data).unwrap();
+        assert_eq!(data, b"abXYefghij");
+    }
+
+    #[test]
+    fn append_preserves_existing_content() {
+        let mut data = b"first".to_vec();
+        DriveFacade::apply_pending_operations(&[write(5, b" second")], &mut data).unwrap();
+        assert_eq!(data, b"first second");
+    }
+
+    #[test]
+    fn sparse_write_zero_fills_gap() {
+        let mut data = b"abc".to_vec();
+        DriveFacade::apply_pending_operations(&[write(5, b"z")], &mut data).unwrap();
+        assert_eq!(data, b"abc\0\0z");
+    }
+
+    #[test]
+    fn operations_apply_in_order() {
+        let operations = [
+            write(4, b"EF"),
+            PendingOperation::Truncate { size: 3 },
+            write(5, b"Z"),
+        ];
+        let mut data = b"abcdef".to_vec();
+        DriveFacade::apply_pending_operations(&operations, &mut data).unwrap();
+        assert_eq!(data, b"abc\0\0Z");
+    }
+
+    #[test]
+    fn write_offset_overflow_is_rejected_without_mutating_data() {
+        let mut data = b"unchanged".to_vec();
+        let result = DriveFacade::apply_pending_operations(&[write(usize::MAX, b"x")], &mut data);
+        assert!(result.is_err());
+        assert_eq!(data, b"unchanged");
+    }
+
+    #[test]
+    fn synchronous_write_overflow_does_not_create_pending_entry() {
+        let mut facade = DriveFacade::new_for_testing();
+        let result = facade.write_and_flush("file".to_string(), usize::MAX, b"x");
+        assert!(result.is_err());
+        assert!(!facade.pending_writes.contains_key("file"));
+    }
+
+    #[test]
+    fn definitive_drive_errors_are_not_indeterminate() {
+        let error = drive3::Error::BadRequest(serde_json::json!({
+            "error": { "code": 400 }
+        }));
+        assert!(!DriveFacade::upload_outcome_is_indeterminate(&error));
+    }
+
+    #[test]
+    fn preparing_data_does_not_clear_pending_operations() {
+        let mut facade = DriveFacade::new_for_testing();
+        facade.write("file".to_string(), 1, b"X").unwrap();
+
+        let data = facade
+            .data_with_pending_operations("file", b"abc".to_vec())
+            .unwrap();
+
+        assert_eq!(data, b"aXc");
+        assert_eq!(facade.pending_writes["file"].len(), 1);
+    }
+
+    #[test]
+    fn failed_flush_retains_pending_operations_for_retry() {
+        let mut facade = DriveFacade::new_for_testing();
+        facade.write("file".to_string(), 0, b"data").unwrap();
+
+        assert!(facade.flush("file").is_err());
+        assert_eq!(facade.pending_writes["file"].len(), 1);
+    }
+
+    #[test]
+    fn failed_synchronous_truncate_rolls_back_before_upload() {
+        let mut facade = DriveFacade::new_for_testing();
+        facade.write("file".to_string(), 0, b"data").unwrap();
+
+        assert!(facade.truncate_and_flush("file".to_string(), 0).is_err());
+        assert_eq!(facade.pending_writes["file"], vec![write(0, b"data")]);
+    }
+
+    #[test]
+    fn failed_synchronous_write_rolls_back_before_upload() {
+        let mut facade = DriveFacade::new_for_testing();
+        facade.write("file".to_string(), 0, b"old").unwrap();
+
+        assert!(
+            facade
+                .write_and_flush("file".to_string(), 3, b"new")
+                .is_err()
+        );
+        assert_eq!(facade.pending_writes["file"], vec![write(0, b"old")]);
+    }
+
+    #[test]
+    fn oversized_truncate_is_rejected_without_mutating_data() {
+        let mut data = b"unchanged".to_vec();
+        let result = DriveFacade::apply_pending_operations(
+            &[PendingOperation::Truncate { size: usize::MAX }],
+            &mut data,
+        );
+        assert!(result.is_err());
+        assert_eq!(data, b"unchanged");
+    }
+
+    #[test]
+    fn reads_include_pending_operations() {
+        let mut facade = DriveFacade::new_for_testing();
+        facade.cache.insert("file".to_string(), b"abcdef".to_vec());
+        facade.write("file".to_string(), 2, b"XY").unwrap();
+        facade.truncate("file".to_string(), 5);
+
+        assert_eq!(facade.read("file", None, 0, 20), Some(&b"abXYe"[..]));
     }
 }

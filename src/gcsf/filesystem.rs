@@ -1,34 +1,22 @@
 use super::{Config, File, FileId, FileManager};
 use crate::DriveFacade;
 use drive3;
-use failure::Error;
+use failure::{Error, err_msg};
 use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyStatfs, ReplyWrite, Request,
+    AccessFlags, BsdFileFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
+    Generation, INodeNo, LockOwner, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyStatfs, ReplyWrite, Request, WriteFlags,
 };
-use libc::{EEXIST, EIO, ENOENT, EROFS};
 use lru_time_cache::LruCache;
 use std;
 use std::clone::Clone;
-use std::cmp;
 use std::ffi::OsStr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 pub type Inode = u64;
 
 const TRASH_INODE: Inode = 2;
-
-macro_rules! log_result {
-    ($expr:expr) => {
-        match $expr {
-            Ok(t) => {
-                debug!("{:?}", t);
-            }
-            Err(e) => {
-                error!("{:?}", e);
-            }
-        }
-    };
-}
 
 macro_rules! log_result_and_fill_reply {
     ($expr:expr,$reply:ident) => {
@@ -39,7 +27,7 @@ macro_rules! log_result_and_fill_reply {
             }
             Err(e) => {
                 error!("{:?}", e);
-                $reply.error(EIO);
+                $reply.error(Errno::EIO);
                 return;
             }
         }
@@ -51,8 +39,24 @@ macro_rules! reject_if_readonly {
     ($self:ident, $reply:ident) => {
         if $self.read_only {
             warn!("Rejecting write operation: filesystem is read-only");
-            $reply.error(EROFS);
+            $reply.error(Errno::EROFS);
             return;
+        } else if $self.shutting_down.load(Ordering::Acquire) {
+            warn!("Rejecting write operation: filesystem is shutting down");
+            $reply.error(Errno::EIO);
+            return;
+        }
+    };
+}
+
+macro_rules! lock_state {
+    ($self:ident, $reply:ident) => {
+        match $self.state() {
+            Ok(state) => state,
+            Err(error) => {
+                $reply.error(error);
+                return;
+            }
         }
     };
 }
@@ -63,11 +67,39 @@ macro_rules! reject_if_readonly {
 pub struct NullFs;
 impl Filesystem for NullFs {}
 
-/// A FUSE file system which is linked to a Google Drive account.
-pub struct Gcsf {
+struct GcsfState {
     manager: FileManager,
     statfs_cache: LruCache<String, u64>,
+}
+
+/// A FUSE file system which is linked to a Google Drive account.
+pub struct Gcsf {
+    state: Arc<Mutex<GcsfState>>,
     read_only: bool,
+    shutting_down: Arc<AtomicBool>,
+}
+
+/// A handle used by the mount process to stop writes and flush pending data safely.
+pub struct GcsfControl {
+    state: Arc<Mutex<GcsfState>>,
+    shutting_down: Arc<AtomicBool>,
+}
+
+impl GcsfControl {
+    /// Rejects future writes and flushes all operations accepted before shutdown began.
+    pub fn begin_shutdown(&self) -> Result<(), Error> {
+        self.shutting_down.store(true, Ordering::Release);
+        self.flush_pending()
+    }
+
+    /// Flushes all pending file operations to Drive.
+    pub fn flush_pending(&self) -> Result<(), Error> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| err_msg("Filesystem state lock was poisoned during shutdown"))?;
+        state.manager.flush_all()
+    }
 }
 
 const TTL: std::time::Duration = std::time::Duration::from_secs(1);
@@ -75,140 +107,219 @@ const TTL: std::time::Duration = std::time::Duration::from_secs(1);
 impl Gcsf {
     /// Constructs a Gcsf instance using a given Config.
     pub fn with_config(config: Config) -> Result<Self, Error> {
+        let manager = FileManager::with_drive_facade(
+            config.rename_identical_files(),
+            config.add_extensions_to_special_files(),
+            config.skip_trash(),
+            config.sync_interval(),
+            DriveFacade::new(&config),
+        )?;
         Ok(Gcsf {
-            manager: FileManager::with_drive_facade(
-                config.rename_identical_files(),
-                config.add_extensions_to_special_files(),
-                config.skip_trash(),
-                config.sync_interval(),
-                DriveFacade::new(&config),
-            )?,
-            statfs_cache: LruCache::<String, u64>::with_expiry_duration_and_capacity(
-                config.cache_statfs_seconds(),
-                2,
-            ),
+            state: Arc::new(Mutex::new(GcsfState {
+                manager,
+                statfs_cache: LruCache::<String, u64>::with_expiry_duration_and_capacity(
+                    config.cache_statfs_seconds(),
+                    2,
+                ),
+            })),
             read_only: config.read_only(),
+            shutting_down: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Returns a handle that can freeze writes and flush pending data during unmount.
+    pub fn control(&self) -> GcsfControl {
+        GcsfControl {
+            state: Arc::clone(&self.state),
+            shutting_down: Arc::clone(&self.shutting_down),
+        }
+    }
+
+    fn state(&self) -> Result<MutexGuard<'_, GcsfState>, Errno> {
+        let state = self.state.lock().map_err(|_| {
+            error!("Filesystem state lock was poisoned; refusing to continue");
+            Errno::EIO
+        })?;
+        if self.shutting_down.load(Ordering::Acquire) {
+            Err(Errno::EIO)
+        } else {
+            Ok(state)
+        }
+    }
+
+    fn remove_file(manager: &mut FileManager, id: &FileId) -> Result<(), Error> {
+        if manager.file_is_trashed(id)? {
+            debug!("{:?} is already trashed. Deleting permanently.", id);
+            manager.delete(id)
+        } else if manager.skip_trash {
+            debug!(
+                "{:?} was not trashed. Deleting it permanently because skip_trash is enabled.",
+                id
+            );
+            manager.delete(id)
+        } else {
+            debug!("{:?} was not trashed. Moving it to Trash.", id);
+            manager.move_file_to_trash(id, true)
+        }
     }
 }
 
 impl Filesystem for Gcsf {
-    fn lookup(&mut self, _req: &Request, parent: Inode, name: &OsStr, reply: ReplyEntry) {
-        // self.manager.sync();
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        let Some(name) = name.to_str() else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        let state = lock_state!(self, reply);
+        let id = FileId::ParentAndName {
+            parent: parent.0,
+            name: name.to_string(),
+        };
 
-        let name = name.to_str().unwrap().to_string();
-        let id = FileId::ParentAndName { parent, name };
-
-        match self.manager.get_file(&id) {
+        match state.manager.get_file(&id) {
             Some(file) => {
-                reply.entry(&TTL, &file.attr, 0);
+                reply.entry(&TTL, &file.attr, Generation(0));
             }
             None => {
-                reply.error(ENOENT);
+                reply.error(Errno::ENOENT);
             }
         };
     }
 
-    fn getattr(&mut self, _req: &Request, ino: Inode, _fh: Option<u64>, reply: ReplyAttr) {
-        // self.manager.sync();
-        match self.manager.get_file(&FileId::Inode(ino)) {
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        let state = lock_state!(self, reply);
+        match state.manager.get_file(&FileId::Inode(ino.0)) {
             Some(file) => {
                 reply.attr(&TTL, &file.attr);
             }
             None => {
-                reply.error(ENOENT);
+                reply.error(Errno::ENOENT);
             }
         };
     }
 
+    fn access(&self, _req: &Request, ino: INodeNo, mask: AccessFlags, reply: ReplyEmpty) {
+        let state = lock_state!(self, reply);
+        if !state.manager.contains(&FileId::Inode(ino.0)) {
+            reply.error(Errno::ENOENT);
+        } else if self.read_only && mask.contains(AccessFlags::W_OK) {
+            reply.error(Errno::EROFS);
+        } else {
+            reply.ok();
+        }
+    }
+
     fn read(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: Inode,
-        _fh: u64,
-        offset: i64,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         size: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        if !self.manager.contains(&FileId::Inode(ino)) {
-            reply.error(ENOENT);
+        let Ok(offset) = usize::try_from(offset) else {
+            reply.error(Errno::EOVERFLOW);
             return;
-        }
+        };
+        let mut state = lock_state!(self, reply);
+        let id = FileId::Inode(ino.0);
+        let Some(file) = state.manager.get_file(&id) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
 
-        let (mime, id) = self
-            .manager
-            .get_file(&FileId::Inode(ino))
-            .map(|f| {
-                let mime = f
-                    .drive_file
-                    .as_ref()
-                    .and_then(|f| f.mime_type.as_ref())
-                    .cloned();
-                let id = f.drive_id().unwrap();
+        let mime = file
+            .drive_file
+            .as_ref()
+            .and_then(|file| file.mime_type.as_ref())
+            .cloned();
+        let Some(drive_id) = file.drive_id() else {
+            reply.error(Errno::EIO);
+            return;
+        };
 
-                (mime, id)
-            })
-            .unwrap();
-
-        match self
+        match state
             .manager
             .df
-            .read(&id, mime, offset as usize, size as usize)
+            .read(&drive_id, mime, offset, size as usize)
         {
             Some(data) => reply.data(data),
             // Returning an empty buffer here would be indistinguishable from a
             // genuinely empty file, silently hiding the failure from the caller.
-            None => reply.error(EIO),
+            None => reply.error(Errno::EIO),
         }
     }
 
     fn write(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: Inode,
-        _fh: u64,
-        offset: i64,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         data: &[u8],
-        _write_flags: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _write_flags: WriteFlags,
+        flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
         reject_if_readonly!(self, reply);
-        let offset: usize = cmp::max(offset, 0) as usize;
-        self.manager.write(FileId::Inode(ino), offset, data);
-
-        match self.manager.get_mut_file(&FileId::Inode(ino)) {
-            Some(ref mut file) => {
-                file.attr.size = offset as u64 + data.len() as u64;
-                reply.written(data.len() as u32);
-            }
-            None => {
-                reply.error(ENOENT);
-            }
+        let Ok(offset) = usize::try_from(offset) else {
+            reply.error(Errno::EOVERFLOW);
+            return;
         };
+        let Some(end) = offset.checked_add(data.len()) else {
+            reply.error(Errno::EOVERFLOW);
+            return;
+        };
+        let mut state = lock_state!(self, reply);
+        let id = FileId::Inode(ino.0);
+        if !state.manager.contains(&id) {
+            reply.error(Errno::ENOENT);
+            return;
+        }
+        let synchronous = flags.0 & (libc::O_SYNC | libc::O_DSYNC) != 0;
+        let write_result = if synchronous {
+            state.manager.write_and_flush(&id, offset, data)
+        } else {
+            state.manager.write(&id, offset, data)
+        };
+        if let Err(error) = write_result {
+            error!("write: {}", error);
+            reply.error(Errno::EIO);
+            return;
+        }
+
+        let Some(file) = state.manager.get_mut_file(&id) else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        file.attr.size = file.attr.size.max(end as u64);
+        file.attr.blocks = file.attr.size.div_ceil(512);
+        reply.written(data.len() as u32);
     }
 
     fn readdir(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: Inode,
-        _fh: u64,
-        offset: i64,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        if let Err(e) = self.manager.sync() {
+        let mut state = lock_state!(self, reply);
+        if let Err(e) = state.manager.sync() {
             debug!("Could not perform sync: {}", e);
         }
-        // println!("current state: {:#?}", self.manager);
 
-        let mut curr_offs = offset + 1;
-        match self.manager.get_children(&FileId::Inode(ino)) {
+        let mut curr_offs = offset.saturating_add(1);
+        match state.manager.get_children(&FileId::Inode(ino.0)) {
             Some(children) => {
-                for child in children.iter().skip(offset as usize) {
-                    if reply.add(child.inode(), curr_offs, child.kind(), child.name()) {
+                let skip = usize::try_from(offset).unwrap_or(usize::MAX);
+                for child in children.iter().skip(skip) {
+                    if reply.add(child.attr.ino, curr_offs, child.kind(), child.name()) {
                         break;
                     } else {
                         curr_offs += 1;
@@ -217,52 +328,74 @@ impl Filesystem for Gcsf {
                 reply.ok();
             }
             None => {
-                reply.error(ENOENT);
+                reply.error(Errno::ENOENT);
             }
         };
     }
 
     fn rename(
-        &mut self,
+        &self,
         _req: &Request,
-        parent: Inode,
+        parent: INodeNo,
         name: &OsStr,
-        newparent: Inode,
+        newparent: INodeNo,
         newname: &OsStr,
-        _flags: u32,
+        flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
         reject_if_readonly!(self, reply);
-        let name = name.to_str().unwrap().to_string();
-        let newname = newname.to_str().unwrap().to_string();
+        #[cfg(target_os = "linux")]
+        let flags_supported = flags.is_empty() || flags == RenameFlags::RENAME_NOREPLACE;
+        #[cfg(not(target_os = "linux"))]
+        let flags_supported = flags.is_empty();
+        if !flags_supported {
+            reply.error(Errno::EINVAL);
+            return;
+        }
+        let (Some(name), Some(newname)) = (name.to_str(), newname.to_str()) else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        let mut state = lock_state!(self, reply);
+        let parent = parent.0;
+        let newparent = newparent.0;
+        let name = name.to_string();
+        let newname = newname.to_string();
 
-        let id = FileId::Inode(
-            self.manager
-                .get_inode(&FileId::ParentAndName { parent, name })
-                .unwrap_or(0),
-        );
-
-        if newparent == TRASH_INODE {
-            let rename_res = self.manager.rename(&id, parent, newname);
-            log_result!(&rename_res);
-
-            let trash_res = self.manager.move_file_to_trash(&id, true);
-            log_result!(&trash_res);
-
-            if rename_res.is_ok() && trash_res.is_ok() {
+        let Some(inode) = state
+            .manager
+            .get_inode(&FileId::ParentAndName { parent, name })
+        else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let id = FileId::Inode(inode);
+        let destination = FileId::ParentAndName {
+            parent: newparent,
+            name: newname.clone(),
+        };
+        if let Some(destination_inode) = state.manager.get_inode(&destination) {
+            if destination_inode == inode {
                 reply.ok();
             } else {
-                reply.error(EIO);
+                // Replacing a Drive object cannot be made atomic. Fail safely rather
+                // than creating two entries with the same POSIX name.
+                reply.error(Errno::EEXIST);
             }
+            return;
+        }
+
+        if newparent == TRASH_INODE {
+            log_result_and_fill_reply!(state.manager.rename_and_move_to_trash(&id, newname), reply);
         } else {
-            log_result_and_fill_reply!(self.manager.rename(&id, newparent, newname), reply);
+            log_result_and_fill_reply!(state.manager.rename(&id, newparent, newname), reply);
         }
     }
 
     fn setattr(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: Inode,
+        ino: INodeNo,
         _mode: Option<u32>,
         uid: Option<u32>,
         gid: Option<u32>,
@@ -270,27 +403,44 @@ impl Filesystem for Gcsf {
         atime: Option<fuser::TimeOrNow>,
         mtime: Option<fuser::TimeOrNow>,
         _ctime: Option<std::time::SystemTime>,
-        _fh: Option<u64>,
+        _fh: Option<FileHandle>,
         crtime: Option<std::time::SystemTime>,
         chgtime: Option<std::time::SystemTime>,
         _bkuptime: Option<std::time::SystemTime>,
-        flags: Option<u32>,
+        flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
         reject_if_readonly!(self, reply);
-        if !self.manager.contains(&FileId::Inode(ino)) {
-            error!("setattr: could not find inode={} in the file tree", ino);
-            reply.error(ENOENT);
+        let mut state = lock_state!(self, reply);
+        let id = FileId::Inode(ino.0);
+        if !state.manager.contains(&id) {
+            error!("setattr: could not find inode={} in the file tree", ino.0);
+            reply.error(Errno::ENOENT);
             return;
         }
 
-        let file = self.manager.get_mut_file(&FileId::Inode(ino)).unwrap();
+        if let Some(size) = size {
+            let Ok(size) = usize::try_from(size) else {
+                reply.error(Errno::EOVERFLOW);
+                return;
+            };
+            if let Err(error) = state.manager.truncate(&id, size) {
+                error!("setattr: could not stage truncate: {}", error);
+                reply.error(Errno::EIO);
+                return;
+            }
+        }
+
+        let Some(file) = state.manager.get_mut_file(&id) else {
+            reply.error(Errno::EIO);
+            return;
+        };
 
         let new_attr = FileAttr {
             ino: file.attr.ino,
             kind: file.attr.kind,
             size: size.unwrap_or(file.attr.size),
-            blocks: file.attr.blocks,
+            blocks: size.unwrap_or(file.attr.size).div_ceil(512),
             blksize: file.attr.blksize,
             atime: match atime.unwrap_or(fuser::TimeOrNow::SpecificTime(file.attr.atime)) {
                 fuser::TimeOrNow::SpecificTime(t) => t,
@@ -307,7 +457,7 @@ impl Filesystem for Gcsf {
             uid: uid.unwrap_or(file.attr.uid),
             gid: gid.unwrap_or(file.attr.gid),
             rdev: file.attr.rdev,
-            flags: flags.unwrap_or(file.attr.flags),
+            flags: flags.map_or(file.attr.flags, |flags| flags.bits()),
         };
 
         file.attr = new_attr;
@@ -315,9 +465,9 @@ impl Filesystem for Gcsf {
     }
 
     fn create(
-        &mut self,
+        &self,
         req: &Request,
-        parent: Inode,
+        parent: INodeNo,
         name: &OsStr,
         _mode: u32,
         _umask: u32,
@@ -325,18 +475,23 @@ impl Filesystem for Gcsf {
         reply: ReplyCreate,
     ) {
         reject_if_readonly!(self, reply);
-        let filename = name.to_str().unwrap().to_string();
+        let Some(filename) = name.to_str().map(str::to_string) else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        let mut state = lock_state!(self, reply);
+        let parent = parent.0;
 
         // TODO: these two checks might not be necessary
-        if !self.manager.contains(&FileId::Inode(parent)) {
+        if !state.manager.contains(&FileId::Inode(parent)) {
             error!(
                 "create: could not find parent inode={} in the file tree",
                 parent
             );
-            reply.error(ENOENT);
+            reply.error(Errno::ENOENT);
             return;
         }
-        if self.manager.contains(&FileId::ParentAndName {
+        if state.manager.contains(&FileId::ParentAndName {
             parent,
             name: filename.clone(),
         }) {
@@ -344,14 +499,19 @@ impl Filesystem for Gcsf {
                 "create: file {:?} of parent(inode={}) already exists",
                 name, parent
             );
-            reply.error(EEXIST);
+            reply.error(Errno::EEXIST);
             return;
         }
+
+        let Some(parent_drive_id) = state.manager.get_drive_id(&FileId::Inode(parent)) else {
+            reply.error(Errno::EIO);
+            return;
+        };
 
         let file = File {
             name: filename.clone(),
             attr: FileAttr {
-                ino: self.manager.next_available_inode(),
+                ino: INodeNo(state.manager.next_available_inode()),
                 kind: FileType::RegularFile,
                 size: 0,
                 blocks: 123,
@@ -371,90 +531,82 @@ impl Filesystem for Gcsf {
             drive_file: Some(drive3::api::File {
                 name: Some(filename),
                 mime_type: None,
-                parents: Some(vec![
-                    self.manager.get_drive_id(&FileId::Inode(parent)).unwrap(),
-                ]),
+                parents: Some(vec![parent_drive_id]),
                 ..Default::default()
             }),
         };
 
         let attr = file.attr;
-        match self.manager.create_file(file, Some(FileId::Inode(parent))) {
+        match state.manager.create_file(file, Some(FileId::Inode(parent))) {
             Ok(()) => {
-                reply.created(&TTL, &attr, 0, 0, 0);
+                reply.created(
+                    &TTL,
+                    &attr,
+                    Generation(0),
+                    FileHandle(0),
+                    FopenFlags::empty(),
+                );
             }
             Err(e) => {
                 error!("create: {}", e);
-                reply.error(EIO);
+                reply.error(Errno::EIO);
             }
         }
     }
 
-    fn unlink(&mut self, _req: &Request, parent: Inode, name: &OsStr, reply: ReplyEmpty) {
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         reject_if_readonly!(self, reply);
+        let Some(name) = name.to_str() else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        let mut state = lock_state!(self, reply);
         let id = FileId::ParentAndName {
-            parent,
-            name: name.to_str().unwrap().to_string(),
+            parent: parent.0,
+            name: name.to_string(),
         };
 
-        if !self.manager.contains(&id) {
-            reply.error(ENOENT);
+        if !state.manager.contains(&id) {
+            reply.error(Errno::ENOENT);
+            return;
+        }
+        if state.manager.get_file(&id).map(File::kind) == Some(FileType::Directory) {
+            reply.error(Errno::EISDIR);
             return;
         }
 
-        match self.manager.file_is_trashed(&id) {
-            Ok(trashed) => {
-                let res = if trashed {
-                    debug!("{:?} is already trashed. Deleting permanently.", id);
-                    self.manager.delete(&id)
-                } else if self.manager.skip_trash {
-                    debug!(
-                        "{:?} was not trashed. Deleting it permanently instead of moving to Trash \
-                    because skip_trash is enabled in the configuration.",
-                        id
-                    );
-                    self.manager.delete(&id)
-                } else {
-                    debug!(
-                        "{:?} was not trashed. Moving it to Trash instead of deleting permanently.",
-                        id
-                    );
-                    self.manager.move_file_to_trash(&id, true)
-                };
-
-                log_result_and_fill_reply!(res, reply);
-            }
-            Err(e) => {
-                error!("{:?}", e);
-                reply.error(EIO);
-            }
-        }
+        log_result_and_fill_reply!(Self::remove_file(&mut state.manager, &id), reply);
     }
 
-    fn forget(&mut self, _req: &Request, _ino: u64, _nlookup: u64) {}
+    fn forget(&self, _req: &Request, _ino: INodeNo, _nlookup: u64) {}
 
     fn mkdir(
-        &mut self,
+        &self,
         _req: &Request,
-        parent: Inode,
+        parent: INodeNo,
         name: &OsStr,
         _mode: u32,
         _umask: u32,
         reply: ReplyEntry,
     ) {
         reject_if_readonly!(self, reply);
-        let dirname = name.to_str().unwrap().to_string();
+        let Some(dirname) = name.to_str().map(str::to_string) else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        let mut state = lock_state!(self, reply);
+        let parent = parent.0;
 
         // TODO: these two checks might not be necessary
-        if !self.manager.contains(&FileId::Inode(parent)) {
+        if !state.manager.contains(&FileId::Inode(parent)) {
             error!(
                 "mkdir: could not find parent inode={} in the file tree",
                 parent
             );
-            reply.error(ENOENT);
+            reply.error(Errno::ENOENT);
             return;
         }
-        if self.manager.contains(&FileId::ParentAndName {
+        if state.manager.contains(&FileId::ParentAndName {
             parent,
             name: dirname.clone(),
         }) {
@@ -462,14 +614,19 @@ impl Filesystem for Gcsf {
                 "mkdir: file {:?} of parent(inode={}) already exists",
                 name, parent
             );
-            reply.error(EEXIST);
+            reply.error(Errno::EEXIST);
             return;
         }
+
+        let Some(parent_drive_id) = state.manager.get_drive_id(&FileId::Inode(parent)) else {
+            reply.error(Errno::EIO);
+            return;
+        };
 
         let dir = File {
             name: dirname.clone(),
             attr: FileAttr {
-                ino: self.manager.next_available_inode(),
+                ino: INodeNo(state.manager.next_available_inode()),
                 kind: FileType::Directory,
                 size: 512,
                 blocks: 1,
@@ -489,74 +646,170 @@ impl Filesystem for Gcsf {
             drive_file: Some(drive3::api::File {
                 name: Some(dirname),
                 mime_type: Some("application/vnd.google-apps.folder".to_string()),
-                parents: Some(vec![
-                    self.manager.get_drive_id(&FileId::Inode(parent)).unwrap(),
-                ]),
+                parents: Some(vec![parent_drive_id]),
                 ..Default::default()
             }),
         };
 
         let attr = dir.attr;
-        match self.manager.create_file(dir, Some(FileId::Inode(parent))) {
+        match state.manager.create_file(dir, Some(FileId::Inode(parent))) {
             Ok(()) => {
-                reply.entry(&TTL, &attr, 0);
+                reply.entry(&TTL, &attr, Generation(0));
             }
             Err(e) => {
                 error!("mkdir: {}", e);
-                reply.error(EIO);
+                reply.error(Errno::EIO);
             }
         }
     }
 
-    fn rmdir(&mut self, _req: &Request, parent: Inode, name: &OsStr, reply: ReplyEmpty) {
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         reject_if_readonly!(self, reply);
-        self.unlink(_req, parent, name, reply);
+        let Some(name) = name.to_str() else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        let mut state = lock_state!(self, reply);
+        let id = FileId::ParentAndName {
+            parent: parent.0,
+            name: name.to_string(),
+        };
+        let Some(file) = state.manager.get_file(&id) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        if file.kind() != FileType::Directory {
+            reply.error(Errno::ENOTDIR);
+            return;
+        }
+        if state
+            .manager
+            .get_children(&id)
+            .is_some_and(|children| !children.is_empty())
+        {
+            reply.error(Errno::ENOTEMPTY);
+            return;
+        }
+
+        log_result_and_fill_reply!(Self::remove_file(&mut state.manager, &id), reply);
     }
 
-    fn flush(&mut self, _req: &Request, ino: Inode, _fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
+    fn flush(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        _lock_owner: LockOwner,
+        reply: ReplyEmpty,
+    ) {
         if self.read_only {
             // In read-only mode, there are no pending writes, so flush is a no-op
             reply.ok();
             return;
         }
-        match self.manager.flush(&FileId::Inode(ino)) {
+        let mut state = lock_state!(self, reply);
+        match state.manager.flush(&FileId::Inode(ino.0)) {
             Ok(()) => reply.ok(),
             Err(e) => {
                 error!("{:?}", e);
-                reply.error(EIO);
+                reply.error(Errno::EIO);
             }
         }
     }
 
-    fn statfs(&mut self, _req: &Request, _ino: u64, reply: ReplyStatfs) {
-        let (size, capacity) = if !self.statfs_cache.contains_key("size")
-            || !self.statfs_cache.contains_key("capacity")
+    fn fsync(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        if self.read_only {
+            reply.ok();
+            return;
+        }
+        let mut state = lock_state!(self, reply);
+        match state.manager.flush(&FileId::Inode(ino.0)) {
+            Ok(()) => reply.ok(),
+            Err(error) => {
+                error!("fsync: {:?}", error);
+                reply.error(Errno::EIO);
+            }
+        }
+    }
+
+    fn release(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        if self.read_only {
+            reply.ok();
+            return;
+        }
+        let mut state = lock_state!(self, reply);
+        match state.manager.flush(&FileId::Inode(ino.0)) {
+            Ok(()) => reply.ok(),
+            Err(error) => {
+                error!("release: {:?}", error);
+                reply.error(Errno::EIO);
+            }
+        }
+    }
+
+    fn destroy(&mut self) {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                error!("Filesystem state is poisoned; attempting a final flush anyway");
+                poisoned.into_inner()
+            }
+        };
+        if let Err(error) = state.manager.flush_all() {
+            let message = format!(
+                "Could not flush all pending writes during unmount: {}",
+                error
+            );
+            error!("{}", message);
+        }
+    }
+
+    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
+        let mut state = lock_state!(self, reply);
+        let (size, capacity) = if !state.statfs_cache.contains_key("size")
+            || !state.statfs_cache.contains_key("capacity")
         {
-            let (size, capacity) = self.manager.df.size_and_capacity().unwrap_or((0, Some(0)));
+            let (size, capacity) = state.manager.df.size_and_capacity().unwrap_or((0, Some(0)));
             let capacity = capacity.unwrap_or(i64::MAX as u64);
-            self.statfs_cache.insert("size".to_string(), size);
-            self.statfs_cache.insert("capacity".to_string(), capacity);
+            state.statfs_cache.insert("size".to_string(), size);
+            state.statfs_cache.insert("capacity".to_string(), capacity);
 
             (size, capacity)
         } else {
             // unwrap_or(&0) because the values might have been dropped from the cache since
             // checking for their existence.
-            let size = self.statfs_cache.get("size").unwrap_or(&0).to_owned();
-            let capacity = self.statfs_cache.get("capacity").unwrap_or(&0).to_owned();
+            let size = state.statfs_cache.get("size").unwrap_or(&0).to_owned();
+            let capacity = state.statfs_cache.get("capacity").unwrap_or(&0).to_owned();
             (size, capacity)
         };
 
         let bsize: u32 = 512;
         let blocks: u64 =
             capacity / (bsize as u64) + if capacity % (bsize as u64) > 0 { 1 } else { 0 };
-        let bfree: u64 = (capacity - size) / (bsize as u64);
+        let bfree: u64 = capacity.saturating_sub(size) / (bsize as u64);
 
         reply.statfs(
             /* blocks:*/ blocks,
             /* bfree: */ bfree,
             /* bavail: */ bfree,
             /* files: */ u64::MAX,
-            /* ffree: */ u64::MAX - self.manager.files.len() as u64,
+            /* ffree: */ u64::MAX - state.manager.files.len() as u64,
             /* bsize: */ bsize,
             /* namelen: */ 1024,
             /* frsize: */ bsize,

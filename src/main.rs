@@ -184,27 +184,32 @@ client_secret = """
 }"""
 "#;
 
-fn mount_gcsf(config: Config, mountpoint: &str) {
+fn mount_gcsf(config: Config, mountpoint: &str) -> Result<(), Error> {
     // TODO: consider making these configurable in the config file
-    let mut options = vec![
-        fuser::MountOption::FSName(String::from("GCSF")),
-        fuser::MountOption::AllowRoot,
-    ];
+    let mut mount_options = vec![fuser::MountOption::FSName(String::from("GCSF"))];
 
     if config.read_only() {
-        options.push(fuser::MountOption::RO);
+        mount_options.push(fuser::MountOption::RO);
         info!("Mounting in read-only mode");
     }
 
+    let mut mount_config = fuser::Config::default();
+    mount_config.mount_options = mount_options;
+    mount_config.acl = fuser::SessionACL::RootAndOwner;
+
     if config.mount_check() {
-        match fuser::spawn_mount2(NullFs {}, mountpoint, &options) {
+        match fuser::spawn_mount(NullFs {}, mountpoint, &mount_config) {
             Ok(session) => {
                 debug!("Test mount of NullFs successful. Will mount GCSF next.");
-                drop(session);
+                if let Err(e) = session.umount_and_join() {
+                    return Err(err_msg(format!(
+                        "Could not cleanly unmount test filesystem: {}",
+                        e
+                    )));
+                }
             }
             Err(e) => {
-                error!("Could not mount to {}: {}", mountpoint, e);
-                return;
+                return Err(err_msg(format!("Could not mount to {}: {}", mountpoint, e)));
             }
         };
     }
@@ -213,15 +218,15 @@ fn mount_gcsf(config: Config, mountpoint: &str) {
     let fs: Gcsf = match Gcsf::with_config(config) {
         Ok(fs) => fs,
         Err(e) => {
-            error!("{}", e);
-            return;
+            return Err(e);
         }
     };
     info!("File system created.");
+    let control = fs.control();
 
     info!("Mounting to {}", mountpoint);
-    match fuser::spawn_mount2(fs, mountpoint, &options) {
-        Ok(_session) => {
+    match fuser::spawn_mount(fs, mountpoint, &mount_config) {
+        Ok(session) => {
             info!("Mounted to {}", mountpoint);
 
             let running = Arc::new(AtomicBool::new(true));
@@ -233,12 +238,37 @@ fn mount_gcsf(config: Config, mountpoint: &str) {
             })
             .expect("Error setting Ctrl-C handler");
 
-            while running.load(Ordering::SeqCst) {
+            while running.load(Ordering::SeqCst) && !session.guard.is_finished() {
                 thread::sleep(time::Duration::from_millis(50));
             }
+
+            let initial_flush_error = control.begin_shutdown().err();
+            let session_result = if session.guard.is_finished() {
+                session.join()
+            } else {
+                session.umount_and_join()
+            };
+            let final_flush_result = control.flush_pending();
+
+            let mut errors = Vec::new();
+            if let Err(error) = session_result {
+                errors.push(format!("Filesystem session ended with an error: {}", error));
+            }
+            if let Err(error) = final_flush_result {
+                if let Some(initial_error) = initial_flush_error {
+                    errors.push(format!("Initial shutdown flush failed: {}", initial_error));
+                }
+                errors.push(format!("Final shutdown flush failed: {}", error));
+            }
+
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(err_msg(errors.join("; ")))
+            }
         }
-        Err(e) => error!("Could not mount to {}: {}", mountpoint, e),
-    };
+        Err(e) => Err(err_msg(format!("Could not mount to {}: {}", mountpoint, e))),
+    }
 }
 
 fn login(config: &mut Config) -> Result<(), Error> {
@@ -482,7 +512,10 @@ fn main() {
             }
             drop(df); // Release the DriveFacade before mount creates its own
 
-            mount_gcsf(config, &mountpoint);
+            if let Err(error) = mount_gcsf(config, &mountpoint) {
+                error!("{}", error);
+                std::process::exit(1);
+            }
         }
     }
 }

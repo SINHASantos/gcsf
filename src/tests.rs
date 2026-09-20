@@ -4,7 +4,7 @@ mod rename_identical_files_tests {
 
     // Helper to create a test file
     fn create_test_file(name: &str, inode: u64, drive_id: Option<String>) -> File {
-        use fuser::{FileAttr, FileType};
+        use fuser::{FileAttr, FileType, INodeNo};
         use std::time::SystemTime;
 
         let drive_file = drive3::api::File {
@@ -16,7 +16,7 @@ mod rename_identical_files_tests {
         File {
             name: name.to_string(),
             attr: FileAttr {
-                ino: inode,
+                ino: INodeNo(inode),
                 size: 1024,
                 blocks: 2,
                 blksize: 512,
@@ -39,7 +39,7 @@ mod rename_identical_files_tests {
 
     // Helper to create a test directory
     fn create_test_directory(name: &str, inode: u64, drive_id: Option<String>) -> File {
-        use fuser::{FileAttr, FileType};
+        use fuser::{FileAttr, FileType, INodeNo};
         use std::time::SystemTime;
 
         let drive_file = drive3::api::File {
@@ -51,7 +51,7 @@ mod rename_identical_files_tests {
         File {
             name: name.to_string(),
             attr: FileAttr {
-                ino: inode,
+                ino: INodeNo(inode),
                 size: 512,
                 blocks: 1,
                 blksize: 512,
@@ -144,9 +144,6 @@ mod rename_identical_files_tests {
             fm.get_file(&FileId::Inode(102)).unwrap().name(),
             "photo.jpg.1"
         );
-
-        // Prevent drop to avoid undefined behavior with uninitialized DriveFacade
-        std::mem::forget(fm);
     }
 
     /// Test: Same name in different directories - NO suffixes (THE BUG REGRESSION TEST)
@@ -191,9 +188,6 @@ mod rename_identical_files_tests {
             fm.get_file(&FileId::Inode(201)).unwrap().name(),
             "photo.jpg"
         );
-
-        // Prevent drop to avoid undefined behavior with uninitialized DriveFacade
-        std::mem::forget(fm);
     }
 
     /// Test: Three duplicates get .1, .2 numbering
@@ -236,9 +230,6 @@ mod rename_identical_files_tests {
             fm.get_file(&FileId::Inode(103)).unwrap().name(),
             "doc.txt.2"
         );
-
-        // Prevent drop to avoid undefined behavior with uninitialized DriveFacade
-        std::mem::forget(fm);
     }
 
     /// Test: Drive ID ordering is deterministic
@@ -274,9 +265,6 @@ mod rename_identical_files_tests {
             Some(2),
             "File with Drive ID 'z_last' should have suffix .2"
         );
-
-        // Prevent drop to avoid undefined behavior with uninitialized DriveFacade
-        std::mem::forget(fm);
     }
 
     /// Test: Suffix removed when file is the only one with that name
@@ -300,9 +288,6 @@ mod rename_identical_files_tests {
             fm.get_file(&FileId::Inode(101)).unwrap().name(),
             "unique.txt"
         );
-
-        // Prevent drop to avoid undefined behavior with uninitialized DriveFacade
-        std::mem::forget(fm);
     }
 
     /// Test: Files without Drive ID are handled correctly
@@ -331,9 +316,6 @@ mod rename_identical_files_tests {
             Some(1),
             "File with Drive ID should have suffix .1"
         );
-
-        // Prevent drop to avoid undefined behavior with uninitialized DriveFacade
-        std::mem::forget(fm);
     }
 }
 
@@ -349,15 +331,30 @@ mod read_only_tests {
 
     #[test]
     fn test_read_only_explicit_true() {
-        let mut config = Config::default();
-        config.read_only = Some(true);
+        let config = Config {
+            read_only: Some(true),
+            ..Config::default()
+        };
         assert!(config.read_only());
     }
 
     #[test]
     fn test_read_only_explicit_false() {
-        let mut config = Config::default();
-        config.read_only = Some(false);
+        let config = Config {
+            read_only: Some(false),
+            ..Config::default()
+        };
         assert!(!config.read_only());
+    }
+}
+
+#[cfg(test)]
+mod fuser_api_tests {
+    use crate::Gcsf;
+
+    #[test]
+    fn filesystem_state_is_thread_safe() {
+        fn assert_send_sync_static<T: Send + Sync + 'static>() {}
+        assert_send_sync_static::<Gcsf>();
     }
 }

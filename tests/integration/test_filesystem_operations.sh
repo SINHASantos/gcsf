@@ -87,6 +87,17 @@ if [ ! -d "$MOUNT_POINT" ]; then
     exit 1
 fi
 
+MOUNT_POINT=$(cd "$MOUNT_POINT" && pwd -P)
+
+assert_mount_active() {
+    if ! mount | grep -F " on $MOUNT_POINT " >/dev/null; then
+        echo -e "${RED}ERROR: GCSF is no longer mounted at '$MOUNT_POINT'${NC}"
+        exit 1
+    fi
+}
+
+assert_mount_active
+
 # Create test directory with timestamp
 TEST_DIR="$MOUNT_POINT/gcsf_ops_test_$(date +%s)"
 
@@ -126,6 +137,7 @@ log_info() {
 # Wait for filesystem sync
 wait_for_sync() {
     sleep 0.2
+    assert_mount_active
 }
 
 # Assertion helpers
@@ -738,7 +750,7 @@ test_concurrent_operations() {
     else
         echo -e "${RED}✗ FAIL: Only $content_ok/10 files have correct content after 3 attempts${NC}"
         echo -e "${RED}Failed files:$failed_files${NC}"
-        ((TEST_FAILED++))
+        ((TESTS_FAILED++))
     fi
 }
 

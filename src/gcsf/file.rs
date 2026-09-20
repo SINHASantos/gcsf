@@ -1,5 +1,5 @@
 use failure::{Error, err_msg};
-use fuser::{FileAttr, FileType};
+use fuser::{FileAttr, FileType, INodeNo};
 use id_tree::NodeId;
 use std::collections::HashMap;
 
@@ -82,7 +82,7 @@ impl File {
         let bsize: u64 = 512;
 
         let mut attr = FileAttr {
-            ino: inode,
+            ino: INodeNo(inode),
             size,
             blocks: size / bsize + if !size.is_multiple_of(bsize) { 1 } else { 0 },
             blksize: bsize as u32,
@@ -180,7 +180,7 @@ impl File {
     }
 
     pub fn inode(&self) -> Inode {
-        self.attr.ino
+        self.attr.ino.0
     }
 
     pub fn kind(&self) -> FileType {
